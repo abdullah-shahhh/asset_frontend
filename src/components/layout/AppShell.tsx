@@ -1,0 +1,130 @@
+import { NavLink, Outlet } from 'react-router-dom'
+import { Map, ClipboardCheck, FolderKanban, Users, HardHat, ShieldCheck, Palette, LogOut, Bell, LifeBuoy } from 'lucide-react'
+import clsx from 'clsx'
+import { useAuth } from '../../auth/AuthContext'
+import { ROUTES } from '../../lib/routes'
+import { useApplyBranding } from '../../theme/useApplyBranding'
+import { mediaUrl } from '../../theme/branding'
+import { Dropdown } from '../ui'
+import mapifyitMark from '../../assets/mapifyit-mark.png'
+
+const NAV = [
+  { to: ROUTES.dashboard, label: 'Map', icon: Map, end: true, permission: null as string | null },
+  { to: ROUTES.submissions, label: 'Submissions', icon: ClipboardCheck, permission: null },
+  { to: ROUTES.projects, label: 'Projects', icon: FolderKanban, permission: null },
+  { to: ROUTES.fieldTeam, label: 'Field Team', icon: HardHat, permission: 'field_team.view' },
+  { to: ROUTES.team, label: 'Team', icon: Users, permission: 'users.view' },
+]
+
+const SETTINGS_NAV = [
+  { to: ROUTES.roles, label: 'Roles', icon: ShieldCheck, permission: 'roles.view' },
+  { to: ROUTES.branding, label: 'Branding', icon: Palette, permission: 'branding.manage' },
+]
+
+function initials(name?: string) {
+  if (!name) return 'U'
+  return name
+    .split(' ')
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((s) => s[0]?.toUpperCase())
+    .join('')
+}
+
+export function AppShell() {
+  const { user, organization, logout, hasPermission } = useAuth()
+  const branding = useApplyBranding()
+  const logoSrc = mediaUrl(branding?.logoUrl)
+  const visibleNav = NAV.filter((n) => !n.permission || hasPermission(n.permission))
+  const visibleSettingsNav = SETTINGS_NAV.filter((n) => !n.permission || hasPermission(n.permission))
+
+  const linkClass = ({ isActive }: { isActive: boolean }) =>
+    clsx(
+      'group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-semibold transition-colors',
+      isActive ? 'bg-primary-50 text-primary-700' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800',
+    )
+
+  return (
+    <div className="flex h-screen w-screen overflow-hidden bg-canvas">
+      <aside className="flex w-64 shrink-0 flex-col bg-white px-4 py-5">
+        <div className="mb-6 flex items-center gap-2.5 px-1">
+          {logoSrc ? (
+            <div className="grid h-10 w-10 shrink-0 place-items-center overflow-hidden rounded-xl bg-primary-50 p-1.5 ring-1 ring-primary-100">
+              <img src={logoSrc} alt={organization?.name} className="h-full w-full object-contain" />
+            </div>
+          ) : (
+            <img src={mapifyitMark} alt="MapifyIT" className="h-8 w-auto shrink-0 object-contain" />
+          )}
+          <div className="min-w-0">
+            <h2 className="truncate text-base font-extrabold leading-tight tracking-tight text-ink">{organization?.name ?? 'MapifyIT'}</h2>
+            <p className="text-xs font-medium text-muted">Urban Asset Management</p>
+          </div>
+        </div>
+
+        <nav className="flex-1 space-y-6 overflow-y-auto">
+          <div>
+            <p className="mb-2 px-3 text-[11px] font-bold uppercase tracking-wider text-slate-400">Main Menu</p>
+            <div className="space-y-1">
+              {visibleNav.map(({ to, label, icon: Icon, end }) => (
+                <NavLink key={to} to={to} end={end} className={linkClass}>
+                  <Icon size={18} strokeWidth={2.25} />
+                  {label}
+                </NavLink>
+              ))}
+            </div>
+          </div>
+
+          {visibleSettingsNav.length > 0 && (
+            <div>
+              <p className="mb-2 px-3 text-[11px] font-bold uppercase tracking-wider text-slate-400">Settings</p>
+              <div className="space-y-1">
+                {visibleSettingsNav.map(({ to, label, icon: Icon }) => (
+                  <NavLink key={to} to={to} className={linkClass}>
+                    <Icon size={18} strokeWidth={2.25} />
+                    {label}
+                  </NavLink>
+                ))}
+              </div>
+            </div>
+          )}
+        </nav>
+
+        <div className="mt-4 flex items-start gap-2.5 rounded-2xl bg-primary-50/60 p-4">
+          <LifeBuoy size={18} className="mt-0.5 shrink-0 text-primary-600" />
+          <div>
+            <p className="text-sm font-semibold text-ink">Need help?</p>
+            <p className="mt-0.5 text-xs text-muted">Reach out to your platform admin for support.</p>
+          </div>
+        </div>
+      </aside>
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="sticky top-0 z-20 flex h-16 shrink-0 items-center gap-3 border-b border-slate-200 bg-white/80 px-6 backdrop-blur">
+          <div className="flex-1" />
+          <div className="flex items-center gap-1.5">
+            <button type="button" className="grid h-9 w-9 place-items-center rounded-lg text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700">
+              <Bell size={18} />
+            </button>
+            <div className="mx-1 h-8 w-px bg-slate-200" />
+            <Dropdown
+              align="right"
+              trigger={
+                <span className="flex items-center gap-2.5 rounded-lg px-1.5 py-1 hover:bg-slate-100">
+                  <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-primary-100 text-xs font-bold text-primary-700">{initials(user?.name)}</span>
+                  <span className="hidden text-left sm:block">
+                    <span className="block text-sm font-semibold leading-tight text-ink">{user?.name}</span>
+                    <span className="block text-xs text-muted">{user?.role}</span>
+                  </span>
+                </span>
+              }
+              items={[{ label: 'Sign out', icon: <LogOut className="h-4 w-4" />, danger: true, onClick: logout }]}
+            />
+          </div>
+        </header>
+        <main className="flex-1 overflow-y-auto p-6">
+          <Outlet />
+        </main>
+      </div>
+    </div>
+  )
+}

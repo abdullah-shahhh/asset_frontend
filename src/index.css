@@ -1,0 +1,163 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,500&display=swap');
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Plus Jakarta Sans', 'Inter', 'Segoe UI', system-ui, sans-serif;
+
+  --color-primary-50: #eef2fb;
+  --color-primary-100: #d9e1f6;
+  --color-primary-200: #b6c5ec;
+  --color-primary-300: #8aa1e0;
+  --color-primary-400: #5e7cd2;
+  --color-primary-500: #3f5dc0;
+  --color-primary-600: #2f4fb4;
+  --color-primary-700: #273f93;
+  --color-primary-800: #213576;
+  --color-primary-900: #1d2d61;
+
+  --color-ink: #1e2431;
+  --color-muted: #64748b;
+  --color-canvas: #f5f7fb;
+  --color-surface: #ffffff;
+
+  --color-success-50: #ecfdf5;
+  --color-success-100: #d1fae5;
+  --color-success-500: #10b981;
+  --color-success-600: #059669;
+  --color-success-700: #047857;
+  --color-success-800: #065f46;
+
+  --color-warning-50: #fffbeb;
+  --color-warning-100: #fef3c7;
+  --color-warning-200: #fde68a;
+  --color-warning-500: #f59e0b;
+  --color-warning-600: #d97706;
+  --color-warning-700: #b45309;
+  --color-warning-800: #92400e;
+
+  --color-danger-50: #fef2f2;
+  --color-danger-100: #fee2e2;
+  --color-danger-200: #fecaca;
+  --color-danger-500: #ef4444;
+  --color-danger-600: #dc2626;
+  --color-danger-700: #b91c1c;
+
+  --color-info-50: #eff6ff;
+  --color-info-100: #dbeafe;
+  --color-info-600: #2563eb;
+  --color-info-700: #1d4ed8;
+
+  --radius-card: 1rem;
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+  --shadow-card-hover: 0 4px 12px rgba(16, 24, 40, 0.08);
+  --shadow-pop: 0 12px 32px rgba(16, 24, 40, 0.14);
+}
+
+:root {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color-ink);
+  background-color: var(--color-canvas);
+  -webkit-font-smoothing: antialiased;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button:not(:disabled),
+[role='button']:not([aria-disabled='true']) {
+  cursor: pointer;
+}
+button:disabled {
+  cursor: not-allowed;
+}
+
+#root {
+  min-height: 100vh;
+  min-height: 100svh;
+}
+
+.maplibregl-map {
+  border-radius: var(--radius-card);
+}
+
+/* Recolor MapLibre's built-in controls to match the app's card language
+   instead of the library's default flat-white squares. */
+.maplibregl-ctrl-group {
+  border-radius: 0.75rem !important;
+  overflow: hidden;
+  border: 1px solid rgba(30, 36, 49, 0.08) !important;
+  box-shadow: var(--shadow-card-hover) !important;
+  background: rgba(255, 255, 255, 0.97) !important;
+  backdrop-filter: blur(6px);
+}
+.maplibregl-ctrl-group button {
+  width: 34px !important;
+  height: 34px !important;
+}
+.maplibregl-ctrl-group button + button {
+  border-top: 1px solid rgba(30, 36, 49, 0.06) !important;
+}
+.maplibregl-ctrl-group button:hover {
+  background-color: var(--color-primary-50) !important;
+}
+.maplibregl-ctrl-scale {
+  border: 2px solid rgba(255, 255, 255, 0.85) !important;
+  border-top: none !important;
+  background: rgba(30, 36, 49, 0.55);
+  backdrop-filter: blur(4px);
+  color: #fff;
+  font-weight: 600;
+  padding: 0 4px 1px;
+  border-radius: 0 0 4px 4px;
+}
+
+/* Slim, unobtrusive scrollbars for panels and tables */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: #cbd5e1;
+  border-radius: 9999px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.animate-fade-in {
+  animation: fade-in 0.18s ease-out;
+}
+.animate-pop-in {
+  animation: pop-in 0.2s ease-out;
+}
