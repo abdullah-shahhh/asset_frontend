@@ -6,5 +6,6 @@ export const ROUTES = {
   fieldTeam: '/field-team',
   team: '/team',
   roles: '/settings/roles',
+  symbologies: '/settings/symbologies',
   branding: '/settings/branding',
 } as const

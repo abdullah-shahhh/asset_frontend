@@ -5,15 +5,14 @@ export interface NetworkAssetListParams {
   page?: number
   limit?: number
   projectId?: string
-  moduleId?: string
+  symbologyId?: string
   assetType?: string
   status?: string
 }
 
 export interface CreateNetworkAssetPayload {
   projectId: string
-  moduleId: string
-  assetType: string
+  symbologyId: string
   geometry: GeoJsonGeometry
   attributes?: Record<string, unknown>
 }
@@ -37,6 +36,6 @@ export const networkAssetsApi = {
   approve: (id: string) => api.post<NetworkAssetFeature>(`/v1/org/network-assets/${id}/approve`),
   reject: (id: string, reason?: string) =>
     api.post<NetworkAssetFeature>(`/v1/org/network-assets/${id}/reject`, { reason }),
-  import: (payload: { projectId: string; moduleId: string; featureCollection: FeatureCollection }) =>
+  import: (payload: { projectId: string; featureCollection: FeatureCollection }) =>
     api.post<ImportSummary>('/v1/org/network-assets/import', payload),
 }

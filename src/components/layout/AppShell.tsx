@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from 'react-router-dom'
-import { Map, ClipboardCheck, FolderKanban, Users, HardHat, ShieldCheck, Palette, LogOut, Bell, LifeBuoy } from 'lucide-react'
+import { Map, ClipboardCheck, FolderKanban, Users, HardHat, ShieldCheck, Palette, LogOut, Bell, LifeBuoy, Paintbrush } from 'lucide-react'
 import clsx from 'clsx'
 import { useAuth } from '../../auth/AuthContext'
 import { ROUTES } from '../../lib/routes'
@@ -18,6 +18,7 @@ const NAV = [
 
 const SETTINGS_NAV = [
   { to: ROUTES.roles, label: 'Roles', icon: ShieldCheck, permission: 'roles.view' },
+  { to: ROUTES.symbologies, label: 'Symbology', icon: Paintbrush, permission: 'symbologies.view' },
   { to: ROUTES.branding, label: 'Branding', icon: Palette, permission: 'branding.manage' },
 ]
 
@@ -53,7 +54,9 @@ export function AppShell() {
               <img src={logoSrc} alt={organization?.name} className="h-full w-full object-contain" />
             </div>
           ) : (
-            <img src={mapifyitMark} alt="MapifyIT" className="h-8 w-auto shrink-0 object-contain" />
+            <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-primary-950">
+              <img src={mapifyitMark} alt="MapifyIT" className="h-7 w-7 object-contain" />
+            </div>
           )}
           <div className="min-w-0">
             <h2 className="truncate text-base font-extrabold leading-tight tracking-tight text-ink">{organization?.name ?? 'MapifyIT'}</h2>

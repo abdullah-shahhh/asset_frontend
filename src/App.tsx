@@ -9,6 +9,7 @@ import { ProjectsPage } from './pages/ProjectsPage'
 import { FieldTeamPage } from './pages/FieldTeamPage'
 import { TeamPage } from './pages/TeamPage'
 import { RolesPage } from './pages/RolesPage'
+import { SymbologyPage } from './pages/SymbologyPage'
 import { BrandingSettingsPage } from './pages/BrandingSettingsPage'
 import { ROUTES } from './lib/routes'
 
@@ -47,6 +48,14 @@ export default function App() {
           element={
             <RequirePermission permission="roles.view">
               <RolesPage />
+            </RequirePermission>
+          }
+        />
+        <Route
+          path={ROUTES.symbologies}
+          element={
+            <RequirePermission permission="symbologies.view">
+              <SymbologyPage />
             </RequirePermission>
           }
         />

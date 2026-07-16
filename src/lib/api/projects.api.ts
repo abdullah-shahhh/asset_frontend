@@ -1,5 +1,5 @@
 import { api } from './client'
-import type { Project } from './types'
+import type { Project, Symbology } from './types'
 
 export interface ProjectListParams {
   page?: number
@@ -19,4 +19,6 @@ export const projectsApi = {
   create: (payload: ProjectPayload) => api.post<Project>('/v1/org/projects', payload),
   update: (id: string, payload: Partial<ProjectPayload>) => api.patch<Project>(`/v1/org/projects/${id}`, payload),
   remove: (id: string) => api.del<null>(`/v1/org/projects/${id}`),
+  getSymbologies: (id: string) => api.get<Symbology[]>(`/v1/org/projects/${id}/symbologies`),
+  setSymbologies: (id: string, symbologyIds: string[]) => api.put<Symbology[]>(`/v1/org/projects/${id}/symbologies`, { symbologyIds }),
 }

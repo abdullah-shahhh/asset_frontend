@@ -30,7 +30,7 @@ export interface Project {
   updatedAt: string
 }
 
-export type GeometryType = 'Point' | 'LineString'
+export type GeometryType = 'Point' | 'LineString' | 'Polygon'
 
 export interface AssetTypeField {
   key: string
@@ -59,17 +59,31 @@ export interface SurveyTemplate {
   module?: { id: string; key: string; name: string }
 }
 
+/** Manager-defined named drawing tool (point/line/polygon) with a color. Field
+ * surveys may only draw with symbologies assigned to their active project. */
+export interface Symbology {
+  id: string
+  name: string
+  key: string
+  geometryType: GeometryType
+  color: string
+  createdAt: string
+  updatedAt: string
+}
+
 export type AssetStatus = 'pending' | 'approved' | 'rejected'
 
 export interface GeoJsonGeometry {
   type: GeometryType
-  coordinates: number[] | number[][]
+  coordinates: number[] | number[][] | number[][][]
 }
 
 export interface NetworkAssetProperties {
   id: string
   projectId: string
-  moduleId: string
+  symbologyId: string | null
+  symbology: { id: string; name: string; key: string; color: string } | null
+  color: string | null
   assetType: string
   geometryType: GeometryType
   attributes: Record<string, unknown>

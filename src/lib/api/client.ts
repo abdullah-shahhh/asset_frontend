@@ -152,6 +152,9 @@ export const api = {
   async patch<T>(path: string, body?: unknown, opts?: RequestOptions): Promise<T> {
     return (await request<T>('PATCH', path, { ...opts, body })).data
   },
+  async put<T>(path: string, body?: unknown, opts?: RequestOptions): Promise<T> {
+    return (await request<T>('PUT', path, { ...opts, body })).data
+  },
   async del<T>(path: string, opts?: RequestOptions): Promise<T> {
     return (await request<T>('DELETE', path, opts)).data
   },

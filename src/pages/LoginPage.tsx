@@ -37,8 +37,10 @@ export function LoginPage() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-canvas px-4">
       <form onSubmit={onSubmit} className="w-full max-w-sm rounded-2xl border border-slate-200 bg-surface p-8 shadow-[var(--shadow-pop)]">
-        <div className="mb-6 flex items-center gap-2.5">
-          <img src={mapifyitMark} alt="MapifyIT" className="h-9 w-auto shrink-0 object-contain" />
+        <div className="mb-6 flex items-center gap-3">
+          <div className="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-primary-950">
+            <img src={mapifyitMark} alt="MapifyIT" className="h-8 w-8 object-contain" />
+          </div>
           <div>
             <h1 className="text-lg font-extrabold tracking-tight text-ink">Asset Management</h1>
             <p className="text-xs font-medium text-muted">Sign in to your workspace</p>
