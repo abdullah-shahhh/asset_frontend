@@ -1,0 +1,72 @@
+import {
+  MapPin,
+  Droplet,
+  Flame,
+  Zap,
+  Wifi,
+  Radio,
+  Lightbulb,
+  TreePine,
+  TrafficCone,
+  Signpost,
+  Wrench,
+  Trash2,
+  Building2,
+  Antenna,
+  Cable,
+  Gauge,
+  AlertTriangle,
+  Waves,
+  Camera,
+  Bell,
+  Router,
+  ParkingCircle,
+  Recycle,
+  Fence,
+  Satellite,
+  Construction,
+  Siren,
+  ShowerHead,
+  Milestone,
+  type LucideIcon,
+} from 'lucide-react'
+
+/** Curated icon palette a manager picks from for a Point symbology — their choice, not ours. */
+export const SYMBOLOGY_ICONS: { key: string; label: string; icon: LucideIcon }[] = [
+  { key: 'MapPin', label: 'Marker', icon: MapPin },
+  { key: 'Droplet', label: 'Water', icon: Droplet },
+  { key: 'Flame', label: 'Hydrant / Gas', icon: Flame },
+  { key: 'Zap', label: 'Electrical', icon: Zap },
+  { key: 'Wifi', label: 'Network', icon: Wifi },
+  { key: 'Radio', label: 'Telecom', icon: Radio },
+  { key: 'Antenna', label: 'Tower', icon: Antenna },
+  { key: 'Satellite', label: 'Satellite', icon: Satellite },
+  { key: 'Router', label: 'Router / ONT', icon: Router },
+  { key: 'Cable', label: 'Cable Point', icon: Cable },
+  { key: 'Lightbulb', label: 'Streetlight', icon: Lightbulb },
+  { key: 'TreePine', label: 'Tree / Park', icon: TreePine },
+  { key: 'TrafficCone', label: 'Roadwork', icon: TrafficCone },
+  { key: 'Construction', label: 'Construction', icon: Construction },
+  { key: 'Signpost', label: 'Signage', icon: Signpost },
+  { key: 'Milestone', label: 'Landmark', icon: Milestone },
+  { key: 'ParkingCircle', label: 'Parking', icon: ParkingCircle },
+  { key: 'Fence', label: 'Boundary', icon: Fence },
+  { key: 'Waves', label: 'Drainage', icon: Waves },
+  { key: 'ShowerHead', label: 'Sprinkler', icon: ShowerHead },
+  { key: 'Recycle', label: 'Waste / Recycling', icon: Recycle },
+  { key: 'Trash2', label: 'Bin', icon: Trash2 },
+  { key: 'Building2', label: 'Site / Building', icon: Building2 },
+  { key: 'Gauge', label: 'Meter', icon: Gauge },
+  { key: 'Wrench', label: 'Maintenance', icon: Wrench },
+  { key: 'Camera', label: 'CCTV', icon: Camera },
+  { key: 'Bell', label: 'Alarm', icon: Bell },
+  { key: 'AlertTriangle', label: 'Hazard', icon: AlertTriangle },
+  { key: 'Siren', label: 'Emergency', icon: Siren },
+]
+
+const ICON_MAP = new Map(SYMBOLOGY_ICONS.map((i) => [i.key, i.icon]))
+
+/** Resolve a stored icon key to its component, falling back to a generic pin. */
+export function resolveSymbologyIcon(key: string | null | undefined): LucideIcon {
+  return (key && ICON_MAP.get(key)) || MapPin
+}

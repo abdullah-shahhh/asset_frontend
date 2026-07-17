@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import maplibregl, { Map as MapLibreMap } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
@@ -13,13 +14,11 @@ import {
   Download,
   ThumbsUp,
   ThumbsDown,
-  Map as MapIcon,
-  Minimize2,
   Crosshair,
   Layers,
   FolderKanban,
-  WifiOff,
-  RotateCw,
+  PenLine,
+  Save,
 } from 'lucide-react'
 import {
   networkAssetsApi,
@@ -34,9 +33,55 @@ import {
 import { BASEMAP_STYLE, mapifyitTransformRequest } from '../lib/maps'
 import { Badge, Button, Card, Modal, Select, Spinner, Textarea, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
-import { cn } from '../lib/cn'
+import { resolveSymbologyIcon } from '../lib/symbologyIcons'
+import { mediaUrl } from '../theme/branding'
 
 const FALLBACK_COLOR = '#64748b'
+
+/** Paint a point marker's content element: colored badge with either the
+ * symbology's chosen icon or, if the org uploaded one, their own custom image. */
+function paintPointMarker(el: HTMLDivElement, color: string, iconKey: string | null, iconUrl: string | null, status: string) {
+  const ring = status === 'rejected' ? '#ef4444' : '#ffffff'
+  const opacity = status === 'rejected' ? 0.55 : status === 'pending' ? 0.85 : 1
+  el.style.cssText = [
+    'width:26px',
+    'height:26px',
+    'border-radius:9999px',
+    `background:${color}`,
+    `border:2px solid ${ring}`,
+    'box-shadow:0 1px 4px rgba(15,23,42,.35)',
+    'display:flex',
+    'align-items:center',
+    'justify-content:center',
+    'overflow:hidden',
+    'cursor:pointer',
+    `opacity:${opacity}`,
+  ].join(';')
+  const customSrc = mediaUrl(iconUrl)
+  if (customSrc) {
+    el.innerHTML = `<img src="${customSrc}" alt="" style="width:100%;height:100%;object-fit:cover;pointer-events:none" />`
+  } else {
+    const Icon = resolveSymbologyIcon(iconKey)
+    el.innerHTML = renderToStaticMarkup(<Icon size={13} color="#ffffff" strokeWidth={2.5} />)
+  }
+}
+/** Paint a draggable vertex handle used while editing an existing shape's
+ * geometry. Carries its own delete badge (as a child element with its own
+ * click handler) rather than relying on click-vs-drag disambiguation on the
+ * marker itself. */
+function paintVertexMarker(el: HTMLDivElement, canDelete: boolean) {
+  el.style.cssText = ['width:16px', 'height:16px', 'border-radius:9999px', 'background:#2f4fb4', 'border:2px solid #ffffff', 'box-shadow:0 1px 3px rgba(15,23,42,.4)', 'cursor:grab', 'position:relative'].join(';')
+  el.innerHTML = canDelete
+    ? '<button type="button" data-role="delete-vertex" style="position:absolute;top:-8px;right:-8px;width:14px;height:14px;border-radius:9999px;background:#ef4444;border:1.5px solid #fff;color:#fff;font-size:9px;line-height:11px;display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0;">×</button>'
+    : ''
+}
+
+/** Paint the smaller "add a vertex here" handle shown at the midpoint of
+ * each edge while editing a line/polygon. */
+function paintMidpointMarker(el: HTMLDivElement) {
+  el.style.cssText = ['width:10px', 'height:10px', 'border-radius:9999px', 'background:rgba(47,79,180,0.55)', 'border:1.5px solid rgba(255,255,255,0.85)', 'cursor:copy'].join(';')
+}
+
 const GEOMETRY_LABEL: Record<GeometryType, string> = { Point: 'Point', LineString: 'Line', Polygon: 'Polygon' }
 
 type Tool = 'point' | 'line' | 'polygon' | null
@@ -48,12 +93,7 @@ export function MapDashboardPage() {
   const { push } = useToast()
   const { hasPermission } = useAuth()
   const canApprove = hasPermission('assets.approve')
-
-  // Landing gate — the workspace only becomes interactive once launched, with
-  // a brief "booting up" transition in between (like opening real software).
-  const [entered, setEntered] = useState(false)
-  const [launching, setLaunching] = useState(false)
-  const [launchWide, setLaunchWide] = useState(false)
+  const canEditGeometry = hasPermission('assets.update')
 
   // Which project's symbologies the draw tools currently offer.
   const [activeProjectId, setActiveProjectId] = useState('')
@@ -70,20 +110,16 @@ export function MapDashboardPage() {
   // Selected existing feature (review panel).
   const [selectedFeature, setSelectedFeature] = useState<NetworkAssetFeature | null>(null)
 
+  // Geometry editing (drag vertices / add / remove points on an existing asset).
+  const [editingFeature, setEditingFeature] = useState<NetworkAssetFeature | null>(null)
+  const [editVertices, setEditVertices] = useState<[number, number][]>([])
+
   const [importOpen, setImportOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
 
   // Status-bar telemetry.
   const [cursorLngLat, setCursorLngLat] = useState<{ lng: number; lat: number } | null>(null)
   const [zoom, setZoom] = useState(13)
-
-  // Set if the basemap fails to load (e.g. a network blip) — MapLibre doesn't
-  // retry on its own, so without this the map just stays blank forever.
-  const [mapError, setMapError] = useState(false)
-  const [mapLoading, setMapLoading] = useState(false)
-  // Bumped whenever a new Map instance is constructed, so effects that add
-  // sources/layers (keyed on data, not on map readiness) know to re-run.
-  const [mapVersion, setMapVersion] = useState(0)
 
   const assetsQuery = useQuery({
     queryKey: ['network-assets', 'map'],
@@ -137,29 +173,47 @@ export function MapDashboardPage() {
     onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to reject', 'error'),
   })
 
+  const saveGeometry = useMutation({
+    mutationFn: () => {
+      if (!editingFeature) throw new Error('No feature being edited')
+      const type = editingFeature.geometry.type
+      const geometry: GeoJsonGeometry =
+        type === 'Point'
+          ? { type: 'Point', coordinates: editVertices[0] }
+          : type === 'LineString'
+            ? { type: 'LineString', coordinates: editVertices }
+            : { type: 'Polygon', coordinates: [[...editVertices, editVertices[0]]] }
+      return networkAssetsApi.update(editingFeature.id, { geometry })
+    },
+    onSuccess: () => {
+      push('Geometry updated', 'success')
+      cancelEditGeometry()
+      invalidateAssets()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to update geometry', 'error'),
+  })
+
+  function startEditGeometry(feature: NetworkAssetFeature) {
+    const geom = feature.geometry
+    const vertices: [number, number][] =
+      geom.type === 'Point' ? [geom.coordinates as [number, number]] : geom.type === 'LineString' ? (geom.coordinates as [number, number][]) : (geom.coordinates[0] as [number, number][]).slice(0, -1)
+    resetDrawing()
+    setSelectedFeature(null)
+    setEditingFeature(feature)
+    setEditVertices(vertices)
+  }
+
+  function cancelEditGeometry() {
+    setEditingFeature(null)
+    setEditVertices([])
+  }
+
   function resetDrawing() {
     setTool(null)
     setLinePoints([])
     setDraftGeometry(null)
     setSymbologyId('')
     setNotes('')
-  }
-
-  function launchWorkspace() {
-    createMap()
-    setLaunching(true)
-    setLaunchWide(false)
-    requestAnimationFrame(() => requestAnimationFrame(() => setLaunchWide(true)))
-    window.setTimeout(() => {
-      setLaunching(false)
-      setEntered(true)
-    }, 750)
-  }
-
-  function exitWorkspace() {
-    resetDrawing()
-    setSelectedFeature(null)
-    setEntered(false)
   }
 
   function finishShape() {
@@ -179,20 +233,8 @@ export function MapDashboardPage() {
     if (!wasActive) setTool(next)
   }
 
-  // Fetching a map/style the user hasn't asked for yet is wasted bandwidth —
-  // the map is only ever constructed from launchWorkspace()/retryMap(), never
-  // eagerly on mount. This effect only tears one down on unmount.
   useEffect(() => {
-    return () => {
-      mapRef.current?.remove()
-      mapRef.current = null
-    }
-  }, [])
-
-  function createMap() {
     if (!mapContainer.current || mapRef.current) return
-    setMapError(false)
-    setMapLoading(true)
     const map = new maplibregl.Map({
       container: mapContainer.current,
       style: BASEMAP_STYLE,
@@ -206,63 +248,28 @@ export function MapDashboardPage() {
     map.on('mousemove', (e) => setCursorLngLat({ lng: e.lngLat.lng, lat: e.lngLat.lat }))
     map.on('mouseout', () => setCursorLngLat(null))
     map.on('zoom', () => setZoom(map.getZoom()))
-    map.on('load', () => {
-      setMapError(false)
-      setMapLoading(false)
-    })
-    // A tile-level 404 is normal at the edges of coverage; only surface an
-    // error banner when the basemap itself never finished loading.
-    map.on('error', () => {
-      if (!map.isStyleLoaded()) {
-        setMapError(true)
-        setMapLoading(false)
-      }
-    })
     mapRef.current = map
-    setMapVersion((v) => v + 1)
-    armLoadTimeout()
-  }
-
-  // Belt-and-braces: if the style fetch just hangs (no error, no load event —
-  // e.g. a stalled connection) rather than failing outright, don't leave the
-  // user staring at a blank map forever.
-  function armLoadTimeout() {
-    window.setTimeout(() => {
-      if (!mapRef.current?.isStyleLoaded()) {
-        setMapError(true)
-        setMapLoading(false)
-      }
-    }, 12000)
-  }
-
-  function retryMap() {
-    setMapError(false)
-    if (mapRef.current) {
-      setMapLoading(true)
-      mapRef.current.setStyle(BASEMAP_STYLE)
-      armLoadTimeout()
-    } else {
-      createMap()
+    return () => {
+      map.remove()
+      mapRef.current = null
+      pointMarkersRef.current.clear()
+      editVertexMarkersRef.current = []
+      editMidpointMarkersRef.current = []
     }
-  }
-
-  // The toolbar/status bar dock in and out of layout on launch/exit — nudge
-  // MapLibre to recompute its canvas size once that settles.
-  useEffect(() => {
-    const id = window.setTimeout(() => mapRef.current?.resize(), 60)
-    return () => window.clearTimeout(id)
-  }, [entered])
+  }, [])
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === 'Escape') {
-        if (tool || draftGeometry) resetDrawing()
+        if (editingFeature) cancelEditGeometry()
+        else if (tool || draftGeometry) resetDrawing()
         else if (selectedFeature) setSelectedFeature(null)
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [tool, draftGeometry, selectedFeature])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool, draftGeometry, selectedFeature, editingFeature])
 
   // Map click behaviour depends on the active tool.
   useEffect(() => {
@@ -272,6 +279,7 @@ export function MapDashboardPage() {
     canvas.style.cursor = tool ? 'crosshair' : ''
 
     function onClick(e: maplibregl.MapMouseEvent) {
+      if (editingFeature) return
       if (tool === 'point' && !draftGeometry) {
         setDraftGeometry({ type: 'Point', coordinates: [e.lngLat.lng, e.lngLat.lat] })
       } else if ((tool === 'line' || tool === 'polygon') && !draftGeometry) {
@@ -283,7 +291,15 @@ export function MapDashboardPage() {
       map.off('click', onClick)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tool, draftGeometry])
+  }, [tool, draftGeometry, editingFeature])
+
+  // Feature-click handlers below are registered once and persist across
+  // re-renders, so they read editing state through a ref rather than a
+  // stale closure value.
+  const editingFeatureRef = useRef<NetworkAssetFeature | null>(null)
+  useEffect(() => {
+    editingFeatureRef.current = editingFeature
+  }, [editingFeature])
 
   // Existing (submitted) assets layer — clicking one opens the review panel.
   useEffect(() => {
@@ -293,7 +309,6 @@ export function MapDashboardPage() {
 
     const symbologyColor = ['coalesce', ['get', 'color'], FALLBACK_COLOR] as unknown as maplibregl.ExpressionSpecification
     const statusOpacity = ['match', ['get', 'status'], 'rejected', 0.3, 'pending', 0.65, 1] as unknown as maplibregl.ExpressionSpecification
-    const strokeColor = ['match', ['get', 'status'], 'rejected', '#ef4444', '#ffffff'] as unknown as maplibregl.ExpressionSpecification
 
     const applyData = () => {
       const source = map.getSource('assets') as maplibregl.GeoJSONSource | undefined
@@ -317,27 +332,14 @@ export function MapDashboardPage() {
         layout: { 'line-join': 'round', 'line-cap': 'round' },
         paint: { 'line-color': symbologyColor, 'line-width': 4, 'line-opacity': statusOpacity },
       })
-      map.addLayer({
-        id: 'assets-points',
-        type: 'circle',
-        source: 'assets',
-        filter: ['==', ['geometry-type'], 'Point'],
-        paint: {
-          'circle-radius': 7,
-          'circle-color': symbologyColor,
-          'circle-opacity': statusOpacity,
-          'circle-stroke-width': 2,
-          'circle-stroke-color': strokeColor,
-        },
-      })
-
       const onFeatureClick = (e: maplibregl.MapLayerMouseEvent) => {
+        if (editingFeatureRef.current) return
         const f = e.features?.[0]
         if (!f?.properties) return
         const full = (fc as unknown as { features: NetworkAssetFeature[] }).features.find((x) => x.id === f.properties!.id)
         if (full) setSelectedFeature(full)
       }
-      const layers = ['assets-points', 'assets-lines', 'assets-polygons']
+      const layers = ['assets-lines', 'assets-polygons']
       layers.forEach((id) => {
         map.on('click', id, onFeatureClick)
         map.on('mouseenter', id, () => (map.getCanvas().style.cursor = 'pointer'))
@@ -347,7 +349,123 @@ export function MapDashboardPage() {
 
     if (map.isStyleLoaded()) applyData()
     else map.once('load', applyData)
-  }, [assetsQuery.data, mapVersion])
+  }, [assetsQuery.data])
+
+  // Point assets render as icon markers (not a GPU circle layer) so each one
+  // can show the symbology's chosen icon, not just a plain dot.
+  const pointMarkersRef = useRef<Map<string, { marker: maplibregl.Marker; content: HTMLDivElement }>>(new Map())
+  useEffect(() => {
+    const map = mapRef.current
+    const features = assetsQuery.data?.featureCollection.features
+    if (!map || !features) return
+
+    const apply = () => {
+      const seen = new Set<string>()
+      for (const feature of features) {
+        if (feature.geometry.type !== 'Point') continue
+        if (feature.id === editingFeature?.id) continue
+        seen.add(feature.id)
+        const [lng, lat] = feature.geometry.coordinates as [number, number]
+        const color = feature.properties.color || FALLBACK_COLOR
+        const existing = pointMarkersRef.current.get(feature.id)
+        if (existing) {
+          existing.marker.setLngLat([lng, lat])
+          paintPointMarker(existing.content, color, feature.properties.icon, feature.properties.iconUrl, feature.properties.status)
+          existing.content.onclick = (e) => {
+            e.stopPropagation()
+            if (!editingFeatureRef.current) setSelectedFeature(feature)
+          }
+        } else {
+          const wrapper = document.createElement('div')
+          wrapper.style.cssText = 'display:inline-block;line-height:0'
+          const content = document.createElement('div')
+          paintPointMarker(content, color, feature.properties.icon, feature.properties.iconUrl, feature.properties.status)
+          content.onclick = (e) => {
+            e.stopPropagation()
+            if (!editingFeatureRef.current) setSelectedFeature(feature)
+          }
+          wrapper.appendChild(content)
+          const marker = new maplibregl.Marker({ element: wrapper }).setLngLat([lng, lat]).addTo(map)
+          pointMarkersRef.current.set(feature.id, { marker, content })
+        }
+      }
+      for (const [id, entry] of pointMarkersRef.current) {
+        if (!seen.has(id)) {
+          entry.marker.remove()
+          pointMarkersRef.current.delete(id)
+        }
+      }
+    }
+
+    if (map.isStyleLoaded()) apply()
+    else map.once('load', apply)
+  }, [assetsQuery.data, editingFeature?.id])
+
+  // Geometry-editing handles — a draggable marker per vertex (with a delete
+  // badge once above the minimum vertex count) plus a smaller midpoint
+  // marker per edge for inserting new vertices. Torn down and rebuilt on
+  // every change rather than incrementally reconciled — simpler and safe at
+  // the vertex counts this app deals with.
+  const editVertexMarkersRef = useRef<maplibregl.Marker[]>([])
+  const editMidpointMarkersRef = useRef<maplibregl.Marker[]>([])
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    editVertexMarkersRef.current.forEach((m) => m.remove())
+    editVertexMarkersRef.current = []
+    editMidpointMarkersRef.current.forEach((m) => m.remove())
+    editMidpointMarkersRef.current = []
+
+    if (!editingFeature) return
+    const geomType = editingFeature.geometry.type
+    const minVertices = geomType === 'Polygon' ? 3 : geomType === 'LineString' ? 2 : 1
+    const canDelete = editVertices.length > minVertices && geomType !== 'Point'
+
+    editVertices.forEach((coord, index) => {
+      const el = document.createElement('div')
+      paintVertexMarker(el, canDelete)
+      const marker = new maplibregl.Marker({ element: el, draggable: true, anchor: 'center' }).setLngLat(coord).addTo(map)
+      marker.on('drag', () => {
+        const { lng, lat } = marker.getLngLat()
+        setEditVertices((prev) => {
+          const next = [...prev]
+          next[index] = [lng, lat]
+          return next
+        })
+      })
+      const deleteBtn = el.querySelector('[data-role="delete-vertex"]') as HTMLButtonElement | null
+      if (deleteBtn) {
+        deleteBtn.onclick = (e) => {
+          e.stopPropagation()
+          setEditVertices((prev) => prev.filter((_, i) => i !== index))
+        }
+      }
+      editVertexMarkersRef.current.push(marker)
+    })
+
+    if (geomType !== 'Point') {
+      const segments: { a: [number, number]; b: [number, number]; insertAt: number }[] = []
+      for (let i = 0; i < editVertices.length - 1; i++) segments.push({ a: editVertices[i], b: editVertices[i + 1], insertAt: i + 1 })
+      if (geomType === 'Polygon' && editVertices.length >= 2) segments.push({ a: editVertices[editVertices.length - 1], b: editVertices[0], insertAt: editVertices.length })
+
+      segments.forEach(({ a, b, insertAt }) => {
+        const mid: [number, number] = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]
+        const el = document.createElement('div')
+        paintMidpointMarker(el)
+        const marker = new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat(mid).addTo(map)
+        el.onclick = (e) => {
+          e.stopPropagation()
+          setEditVertices((prev) => {
+            const next = [...prev]
+            next.splice(insertAt, 0, mid)
+            return next
+          })
+        }
+        editMidpointMarkersRef.current.push(marker)
+      })
+    }
+  }, [editingFeature, editVertices])
 
   // Draft (in-progress) drawing layer.
   const pendingMarkerRef = useRef<maplibregl.Marker | null>(null)
@@ -357,16 +475,25 @@ export function MapDashboardPage() {
 
     pendingMarkerRef.current?.remove()
     pendingMarkerRef.current = null
-    if (draftGeometry?.type === 'Point') {
+    // Points being edited get their own draggable handle from the vertex-editing
+    // effect, so only draw the plain pending marker for the create flow.
+    if (!editingFeature && draftGeometry?.type === 'Point') {
       pendingMarkerRef.current = new maplibregl.Marker({ color: '#2f4fb4' }).setLngLat(draftGeometry.coordinates as [number, number]).addTo(map)
     }
 
     let pathCoords: [number, number][] = linePoints
     let polygonRing: [number, number][] | null = null
-    if (draftGeometry?.type === 'LineString') pathCoords = draftGeometry.coordinates as [number, number][]
-    if (draftGeometry?.type === 'Polygon') {
-      polygonRing = draftGeometry.coordinates[0] as [number, number][]
-      pathCoords = polygonRing.slice(0, -1)
+    if (editingFeature && editingFeature.geometry.type === 'Polygon') {
+      polygonRing = [...editVertices, editVertices[0]]
+      pathCoords = editVertices
+    } else if (editingFeature && editingFeature.geometry.type === 'LineString') {
+      pathCoords = editVertices
+    } else {
+      if (draftGeometry?.type === 'LineString') pathCoords = draftGeometry.coordinates as [number, number][]
+      if (draftGeometry?.type === 'Polygon') {
+        polygonRing = draftGeometry.coordinates[0] as [number, number][]
+        pathCoords = polygonRing.slice(0, -1)
+      }
     }
 
     const fc: GeoJSON.FeatureCollection = {
@@ -374,7 +501,9 @@ export function MapDashboardPage() {
       features: [
         ...(polygonRing ? [{ type: 'Feature' as const, geometry: { type: 'Polygon' as const, coordinates: [polygonRing] }, properties: {} }] : []),
         ...(!polygonRing && pathCoords.length >= 2 ? [{ type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: pathCoords }, properties: {} }] : []),
-        ...pathCoords.map((c) => ({ type: 'Feature' as const, geometry: { type: 'Point' as const, coordinates: c }, properties: {} })),
+        // Edit mode already shows draggable vertex handles for every point —
+        // the generic dots here would just duplicate them.
+        ...(editingFeature ? [] : pathCoords.map((c) => ({ type: 'Feature' as const, geometry: { type: 'Point' as const, coordinates: c }, properties: {} }))),
       ],
     }
 
@@ -392,7 +521,7 @@ export function MapDashboardPage() {
 
     if (map.isStyleLoaded()) applyDraft()
     else map.once('load', applyDraft)
-  }, [draftGeometry, linePoints, mapVersion])
+  }, [draftGeometry, linePoints, editingFeature, editVertices])
 
   const showForm = Boolean(draftGeometry)
   const canFinishShape = (tool === 'line' && linePoints.length >= 2) || (tool === 'polygon' && linePoints.length >= 3)
@@ -401,228 +530,205 @@ export function MapDashboardPage() {
   return (
     <div className="relative h-[calc(100vh-7rem)] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-[var(--shadow-card)]">
       <div className="flex h-full flex-col">
-        {entered && (
-          <div className="flex h-14 shrink-0 items-center gap-1 border-b border-slate-200 bg-white px-3 animate-fade-in">
-            <select
-              value={activeProjectId}
-              onChange={(e) => {
-                setActiveProjectId(e.target.value)
-                resetDrawing()
-              }}
-              className="h-9 max-w-[11rem] rounded-lg border-0 bg-slate-50 px-2.5 text-sm font-semibold text-ink outline-none focus:ring-2 focus:ring-primary-500/30"
-            >
-              <option value="">Select project…</option>
-              {(projectsQuery.data?.items ?? []).map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </select>
-            <div className="mx-1.5 h-6 w-px bg-slate-200" />
-            <ToolbarButton active={tool === 'point'} disabled={!pointSymbologies.length} onClick={() => toggleTool('point')} icon={<MapPin size={16} />} label={tool === 'point' ? 'Cancel' : 'Point'} />
-            <ToolbarButton active={tool === 'line'} disabled={!lineSymbologies.length} onClick={() => toggleTool('line')} icon={<Spline size={16} />} label={tool === 'line' ? 'Cancel' : 'Line'} />
-            <ToolbarButton active={tool === 'polygon'} disabled={!polygonSymbologies.length} onClick={() => toggleTool('polygon')} icon={<Square size={16} />} label={tool === 'polygon' ? 'Cancel' : 'Polygon'} />
-            <div className="mx-1.5 h-6 w-px bg-slate-200" />
-            <ToolbarButton onClick={() => setImportOpen(true)} icon={<Upload size={16} />} label="Import" />
-            <ToolbarButton onClick={() => setExportOpen(true)} icon={<Download size={16} />} label="Export" />
-            <div className="flex-1" />
-            <ToolbarButton onClick={exitWorkspace} icon={<Minimize2 size={16} />} label="Exit Workspace" />
-          </div>
-        )}
+        <div className="flex h-14 shrink-0 items-center gap-1 border-b border-slate-200 bg-white px-3">
+          <select
+            value={activeProjectId}
+            onChange={(e) => {
+              setActiveProjectId(e.target.value)
+              resetDrawing()
+            }}
+            className="h-9 max-w-[11rem] rounded-lg border-0 bg-slate-50 px-2.5 text-sm font-semibold text-ink outline-none focus:ring-2 focus:ring-primary-500/30"
+          >
+            <option value="">Select project…</option>
+            {(projectsQuery.data?.items ?? []).map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+          <div className="mx-1.5 h-6 w-px bg-slate-200" />
+          <ToolbarButton active={tool === 'point'} disabled={!pointSymbologies.length || !!editingFeature} onClick={() => toggleTool('point')} icon={<MapPin size={16} />} label={tool === 'point' ? 'Cancel' : 'Point'} />
+          <ToolbarButton active={tool === 'line'} disabled={!lineSymbologies.length || !!editingFeature} onClick={() => toggleTool('line')} icon={<Spline size={16} />} label={tool === 'line' ? 'Cancel' : 'Line'} />
+          <ToolbarButton active={tool === 'polygon'} disabled={!polygonSymbologies.length || !!editingFeature} onClick={() => toggleTool('polygon')} icon={<Square size={16} />} label={tool === 'polygon' ? 'Cancel' : 'Polygon'} />
+          <div className="mx-1.5 h-6 w-px bg-slate-200" />
+          <ToolbarButton disabled={!!editingFeature} onClick={() => setImportOpen(true)} icon={<Upload size={16} />} label="Import" />
+          <ToolbarButton disabled={!!editingFeature} onClick={() => setExportOpen(true)} icon={<Download size={16} />} label="Export" />
+        </div>
 
         <div className="relative min-h-0 flex-1">
-          <div ref={mapContainer} className="absolute inset-0" />
+          {/* MapLibre owns this container exclusively — it appends its own
+              canvas/controls into it imperatively, outside React's control.
+              It must never also receive React-rendered children, or React's
+              reconciliation and MapLibre's direct DOM writes fight each other. */}
+          <div ref={mapContainer} className="h-full w-full" />
 
-          {!entered && !launching && (
-            <div className="absolute inset-0 z-30 flex items-center justify-center bg-gradient-to-br from-primary-950 via-primary-900 to-primary-800">
-              <div className="flex flex-col items-center gap-5 px-6 text-center">
-                <div className="grid h-16 w-16 place-items-center rounded-2xl bg-white/10 text-white ring-1 ring-white/15">
-                  <MapIcon className="h-8 w-8" />
-                </div>
-                <div>
-                  <h1 className="text-2xl font-bold text-white">Survey Map Workspace</h1>
-                  <p className="mt-1.5 max-w-sm text-sm text-white/60">Place points, draw routes, and trace polygons against a project's symbology — then review submissions right on the map.</p>
-                </div>
-                <div className="flex items-center gap-3 text-xs font-semibold text-white/70">
-                  <span className="rounded-full bg-white/10 px-3 py-1">{projectsQuery.data?.pagination?.total ?? projectsQuery.data?.items.length ?? 0} projects</span>
-                  <span className="rounded-full bg-white/10 px-3 py-1">{featureCount} assets</span>
-                </div>
-                <Button size="lg" onClick={launchWorkspace}>
-                  Open Map Workspace
-                </Button>
+          {/* Symbology legend for the active project */}
+          {activeProjectId && !!projectSymbologies.length && (
+            <Card className="absolute bottom-4 right-4 z-20 max-w-xs overflow-hidden !rounded-xl shadow-[var(--shadow-card-hover)]">
+              <div className="flex items-center gap-1.5 border-b border-slate-100 bg-slate-50 px-3 py-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                <Layers size={12} />
+                Legend
               </div>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 px-3.5 py-2.5 text-xs font-medium text-slate-600">
+                {projectSymbologies.map((s) => (
+                  <span key={s.id} className="flex items-center gap-1.5">
+                    <span className="h-2.5 w-2.5 rounded-full ring-2 ring-white" style={{ backgroundColor: s.color, boxShadow: '0 0 0 1px rgba(30,36,49,0.12)' }} />
+                    <span>{s.name}</span>
+                  </span>
+                ))}
+              </div>
+            </Card>
+          )}
+
+          {assetsQuery.isLoading && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/40 backdrop-blur-[1px]">
+              <Spinner />
             </div>
           )}
 
-          {launching && (
-            <div className="absolute inset-0 z-40 flex items-center justify-center bg-gradient-to-br from-primary-950 via-primary-900 to-primary-800">
-              <div className="flex flex-col items-center gap-4">
-                <Spinner className="h-8 w-8 border-white/20 border-t-white" />
-                <p className="text-sm font-semibold text-white/80">Initializing survey workspace…</p>
-                <div className="h-1 w-48 overflow-hidden rounded-full bg-white/15">
-                  <div className={cn('h-full rounded-full bg-white transition-all duration-700 ease-out', launchWide ? 'w-full' : 'w-[6%]')} />
-                </div>
-              </div>
+          {!activeProjectId && tool === null && !selectedFeature && !editingFeature && (
+            <div className="absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded-lg bg-ink/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">Select a project in the toolbar to start drawing</div>
+          )}
+
+          {tool === 'point' && !draftGeometry && (
+            <div className="absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded-lg bg-ink/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">Click the map to place a point</div>
+          )}
+
+          {(tool === 'line' || tool === 'polygon') && !draftGeometry && (
+            <div className="absolute left-1/2 top-4 z-20 flex -translate-x-1/2 items-center gap-2 rounded-lg bg-ink/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">
+              <span>
+                Click to add {tool === 'polygon' ? 'vertices' : 'points'} ({linePoints.length} placed)
+              </span>
+              <button onClick={undoLinePoint} disabled={!linePoints.length} className="ml-1 rounded p-1 hover:bg-white/20 disabled:opacity-40">
+                <Undo2 size={14} />
+              </button>
+              <button onClick={finishShape} disabled={!canFinishShape} className="rounded p-1 hover:bg-white/20 disabled:opacity-40">
+                <Check size={14} />
+              </button>
+              <button onClick={resetDrawing} className="rounded p-1 hover:bg-white/20">
+                <X size={14} />
+              </button>
             </div>
           )}
 
-          {entered && (
-            <>
-              {/* Symbology legend for the active project */}
-              {activeProjectId && !!projectSymbologies.length && (
-                <Card className="absolute bottom-4 right-4 z-20 max-w-xs overflow-hidden !rounded-xl shadow-[var(--shadow-card-hover)]">
-                  <div className="flex items-center gap-1.5 border-b border-slate-100 bg-slate-50 px-3 py-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                    <Layers size={12} />
-                    Legend
-                  </div>
-                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 px-3.5 py-2.5 text-xs font-medium text-slate-600">
-                    {projectSymbologies.map((s) => (
-                      <span key={s.id} className="flex items-center gap-1.5">
-                        <span className="h-2.5 w-2.5 rounded-full ring-2 ring-white" style={{ backgroundColor: s.color, boxShadow: '0 0 0 1px rgba(30,36,49,0.12)' }} />
-                        <span>{s.name}</span>
-                      </span>
-                    ))}
-                  </div>
-                </Card>
-              )}
+          {/* New-asset submission panel */}
+          {showForm && (
+            <div className="absolute right-4 top-4 z-20 w-80">
+              <Card className="overflow-hidden shadow-xl">
+                <PanelHeader icon={<MapPin size={14} />} title={`New ${draftGeometry && GEOMETRY_LABEL[draftGeometry.type]} Asset`} right={<Badge tone="neutral">{draftGeometry?.type}</Badge>} />
+                <div className="p-4">
+                  <Select
+                    label="Symbology"
+                    value={symbologyId}
+                    onChange={(e) => setSymbologyId(e.target.value)}
+                    placeholder="Select symbology"
+                    options={eligibleSymbologies.map((s) => ({ value: s.id, label: s.name }))}
+                    containerClassName="mb-3"
+                  />
+                  <Textarea label="Notes (optional)" value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} containerClassName="mb-3" />
 
-              {mapError && (
-                <div className="absolute inset-0 z-30 flex items-center justify-center bg-white">
-                  <div className="flex flex-col items-center gap-3 px-6 text-center">
-                    <div className="grid h-12 w-12 place-items-center rounded-2xl bg-danger-50 text-danger-600">
-                      <WifiOff className="h-6 w-6" />
-                    </div>
-                    <div>
-                      <div className="text-sm font-bold text-ink">Couldn't load the basemap</div>
-                      <p className="mt-1 max-w-xs text-xs text-muted">The map tile service didn't respond. Check your connection and try again.</p>
-                    </div>
-                    <Button size="sm" leftIcon={<RotateCw size={14} />} onClick={retryMap}>
-                      Retry
+                  <div className="flex gap-2">
+                    <Button variant="outline" onClick={resetDrawing} className="flex-1">
+                      Cancel
+                    </Button>
+                    <Button onClick={() => createAsset.mutate()} loading={createAsset.isPending} disabled={!symbologyId} className="flex-1">
+                      Submit
                     </Button>
                   </div>
                 </div>
-              )}
+              </Card>
+            </div>
+          )}
 
-              {(assetsQuery.isLoading || (mapLoading && !mapError)) && (
-                <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/40 backdrop-blur-[1px]">
-                  <Spinner />
-                </div>
-              )}
-
-              {!activeProjectId && tool === null && !selectedFeature && (
-                <div className="absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded-lg bg-ink/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">Select a project in the toolbar to start drawing</div>
-              )}
-
-              {tool === 'point' && !draftGeometry && (
-                <div className="absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded-lg bg-ink/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">Click the map to place a point</div>
-              )}
-
-              {(tool === 'line' || tool === 'polygon') && !draftGeometry && (
-                <div className="absolute left-1/2 top-4 z-20 flex -translate-x-1/2 items-center gap-2 rounded-lg bg-ink/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">
-                  <span>
-                    Click to add {tool === 'polygon' ? 'vertices' : 'points'} ({linePoints.length} placed)
-                  </span>
-                  <button onClick={undoLinePoint} disabled={!linePoints.length} className="ml-1 rounded p-1 hover:bg-white/20 disabled:opacity-40">
-                    <Undo2 size={14} />
-                  </button>
-                  <button onClick={finishShape} disabled={!canFinishShape} className="rounded p-1 hover:bg-white/20 disabled:opacity-40">
-                    <Check size={14} />
-                  </button>
-                  <button onClick={resetDrawing} className="rounded p-1 hover:bg-white/20">
-                    <X size={14} />
-                  </button>
-                </div>
-              )}
-
-              {/* New-asset submission panel */}
-              {showForm && (
-                <div className="absolute right-4 top-4 z-20 w-80">
-                  <Card className="overflow-hidden shadow-xl">
-                    <PanelHeader icon={<MapPin size={14} />} title={`New ${draftGeometry && GEOMETRY_LABEL[draftGeometry.type]} Asset`} right={<Badge tone="neutral">{draftGeometry?.type}</Badge>} />
-                    <div className="p-4">
-                      <Select
-                        label="Symbology"
-                        value={symbologyId}
-                        onChange={(e) => setSymbologyId(e.target.value)}
-                        placeholder="Select symbology"
-                        options={eligibleSymbologies.map((s) => ({ value: s.id, label: s.name }))}
-                        containerClassName="mb-3"
-                      />
-                      <Textarea label="Notes (optional)" value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} containerClassName="mb-3" />
-
-                      <div className="flex gap-2">
-                        <Button variant="outline" onClick={resetDrawing} className="flex-1">
-                          Cancel
-                        </Button>
-                        <Button onClick={() => createAsset.mutate()} loading={createAsset.isPending} disabled={!symbologyId} className="flex-1">
-                          Submit
-                        </Button>
-                      </div>
-                    </div>
-                  </Card>
-                </div>
-              )}
-
-              {/* Review panel for an existing asset — approve/reject right from the map. */}
-              {selectedFeature && (
-                <div className="absolute right-4 top-4 z-20 w-80">
-                  <Card className="overflow-hidden shadow-xl">
-                    <PanelHeader
-                      icon={<span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: selectedFeature.properties.symbology?.color ?? FALLBACK_COLOR }} />}
-                      title={selectedFeature.properties.symbology?.name ?? selectedFeature.properties.assetType.replace(/_/g, ' ')}
-                      subtitle={selectedFeature.properties.geometryType}
-                      onClose={() => setSelectedFeature(null)}
-                    />
-                    <div className="p-4">
-                      <Badge tone={selectedFeature.properties.status === 'approved' ? 'success' : selectedFeature.properties.status === 'rejected' ? 'danger' : 'warning'} className="mb-3">
-                        {selectedFeature.properties.status}
-                      </Badge>
-                      {Object.keys(selectedFeature.properties.attributes || {}).length > 0 && (
-                        <div className="mb-3 space-y-1 rounded-lg bg-slate-50 p-2.5 text-xs">
-                          {Object.entries(selectedFeature.properties.attributes).map(([k, v]) => (
-                            <div key={k} className="flex justify-between gap-2">
-                              <span className="text-muted">{titleize(k)}</span>
-                              <span className="font-medium text-ink">{String(v)}</span>
-                            </div>
-                          ))}
+          {/* Review panel for an existing asset — approve/reject right from the map. */}
+          {selectedFeature && (
+            <div className="absolute right-4 top-4 z-20 w-80">
+              <Card className="overflow-hidden shadow-xl">
+                <PanelHeader
+                  icon={<span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: selectedFeature.properties.symbology?.color ?? FALLBACK_COLOR }} />}
+                  title={selectedFeature.properties.symbology?.name ?? selectedFeature.properties.assetType.replace(/_/g, ' ')}
+                  subtitle={selectedFeature.properties.geometryType}
+                  onClose={() => setSelectedFeature(null)}
+                />
+                <div className="p-4">
+                  <Badge tone={selectedFeature.properties.status === 'approved' ? 'success' : selectedFeature.properties.status === 'rejected' ? 'danger' : 'warning'} className="mb-3">
+                    {selectedFeature.properties.status}
+                  </Badge>
+                  {Object.keys(selectedFeature.properties.attributes || {}).length > 0 && (
+                    <div className="mb-3 space-y-1 rounded-lg bg-slate-50 p-2.5 text-xs">
+                      {Object.entries(selectedFeature.properties.attributes).map(([k, v]) => (
+                        <div key={k} className="flex justify-between gap-2">
+                          <span className="text-muted">{titleize(k)}</span>
+                          <span className="font-medium text-ink">{String(v)}</span>
                         </div>
-                      )}
-                      {selectedFeature.properties.status === 'pending' && canApprove && (
-                        <div className="flex gap-2">
-                          <Button variant="outline" leftIcon={<ThumbsDown size={14} />} onClick={() => reject.mutate(selectedFeature.id)} loading={reject.isPending} className="flex-1">
-                            Reject
-                          </Button>
-                          <Button leftIcon={<ThumbsUp size={14} />} onClick={() => approve.mutate(selectedFeature.id)} loading={approve.isPending} className="flex-1">
-                            Approve
-                          </Button>
-                        </div>
-                      )}
+                      ))}
                     </div>
-                  </Card>
+                  )}
+                  {selectedFeature.properties.status === 'pending' && canApprove && (
+                    <div className="mb-2 flex gap-2">
+                      <Button variant="outline" leftIcon={<ThumbsDown size={14} />} onClick={() => reject.mutate(selectedFeature.id)} loading={reject.isPending} className="flex-1">
+                        Reject
+                      </Button>
+                      <Button leftIcon={<ThumbsUp size={14} />} onClick={() => approve.mutate(selectedFeature.id)} loading={approve.isPending} className="flex-1">
+                        Approve
+                      </Button>
+                    </div>
+                  )}
+                  {canEditGeometry && (
+                    <Button variant="outline" leftIcon={<PenLine size={14} />} onClick={() => startEditGeometry(selectedFeature)} className="w-full">
+                      Edit Geometry
+                    </Button>
+                  )}
                 </div>
-              )}
-            </>
+              </Card>
+            </div>
+          )}
+
+          {/* Geometry-editing panel — drag vertices, add/remove points, save or cancel. */}
+          {editingFeature && (
+            <div className="absolute right-4 top-4 z-20 w-80">
+              <Card className="overflow-hidden shadow-xl">
+                <PanelHeader
+                  icon={<PenLine size={14} />}
+                  title={`Editing ${editingFeature.properties.symbology?.name ?? editingFeature.properties.assetType.replace(/_/g, ' ')}`}
+                  subtitle={GEOMETRY_LABEL[editingFeature.geometry.type]}
+                  onClose={cancelEditGeometry}
+                />
+                <div className="p-4">
+                  <p className="mb-3 text-xs text-muted">
+                    Drag a point to move it.
+                    {editingFeature.geometry.type !== 'Point' && ' Click a vertex’s × to remove it, or click a midpoint to add one.'}
+                  </p>
+                  <div className="flex gap-2">
+                    <Button variant="outline" onClick={cancelEditGeometry} className="flex-1">
+                      Cancel
+                    </Button>
+                    <Button leftIcon={<Save size={14} />} onClick={() => saveGeometry.mutate()} loading={saveGeometry.isPending} disabled={editVertices.length === 0} className="flex-1">
+                      Save
+                    </Button>
+                  </div>
+                </div>
+              </Card>
+            </div>
           )}
         </div>
 
-        {entered && (
-          <div className="flex h-7 shrink-0 items-center gap-4 border-t border-slate-100 bg-slate-50 px-3.5 text-[11px] font-medium text-slate-500 animate-fade-in">
-            <span className="flex items-center gap-1">
-              <FolderKanban size={11} />
-              {activeProject?.name ?? 'No project selected'}
-            </span>
-            <span className="flex items-center gap-1">
-              <Layers size={11} />
-              {featureCount} asset{featureCount === 1 ? '' : 's'}
-            </span>
-            <div className="flex-1" />
-            <span className="flex items-center gap-1 tabular-nums">
-              <Crosshair size={11} />
-              {cursorLngLat ? `${cursorLngLat.lat.toFixed(5)}, ${cursorLngLat.lng.toFixed(5)}` : '—'}
-            </span>
-            <span className="tabular-nums">Zoom {zoom.toFixed(1)}</span>
-          </div>
-        )}
+        <div className="flex h-7 shrink-0 items-center gap-4 border-t border-slate-100 bg-slate-50 px-3.5 text-[11px] font-medium text-slate-500">
+          <span className="flex items-center gap-1">
+            <FolderKanban size={11} />
+            {activeProject?.name ?? 'No project selected'}
+          </span>
+          <span className="flex items-center gap-1">
+            <Layers size={11} />
+            {featureCount} asset{featureCount === 1 ? '' : 's'}
+          </span>
+          <div className="flex-1" />
+          <span className="flex items-center gap-1 tabular-nums">
+            <Crosshair size={11} />
+            {cursorLngLat ? `${cursorLngLat.lat.toFixed(5)}, ${cursorLngLat.lng.toFixed(5)}` : '—'}
+          </span>
+          <span className="tabular-nums">Zoom {zoom.toFixed(1)}</span>
+        </div>
       </div>
 
       <ImportModal open={importOpen} onClose={() => setImportOpen(false)} projects={projectsQuery.data?.items ?? []} onDone={invalidateAssets} pushToast={push} />

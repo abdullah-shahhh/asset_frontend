@@ -67,6 +67,10 @@ export interface Symbology {
   key: string
   geometryType: GeometryType
   color: string
+  /** Icon key from the curated picker (Point symbologies only) — the client's choice. */
+  icon: string | null
+  /** A custom-uploaded icon image — takes precedence over `icon` when set. */
+  iconUrl: string | null
   createdAt: string
   updatedAt: string
 }
@@ -82,8 +86,10 @@ export interface NetworkAssetProperties {
   id: string
   projectId: string
   symbologyId: string | null
-  symbology: { id: string; name: string; key: string; color: string } | null
+  symbology: { id: string; name: string; key: string; color: string; icon: string | null; iconUrl: string | null } | null
   color: string | null
+  icon: string | null
+  iconUrl: string | null
   assetType: string
   geometryType: GeometryType
   attributes: Record<string, unknown>

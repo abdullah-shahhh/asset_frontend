@@ -1,9 +1,11 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { MapPin, Palette, Pencil, Plus, Spline, Square, Trash2 } from 'lucide-react'
+import { MapPin, Palette, Pencil, Plus, Spline, Square, Trash2, Upload, X } from 'lucide-react'
 import { symbologiesApi, ApiError, type GeometryType, type Symbology } from '../lib/api'
-import { Badge, Button, Card, ConfirmDialog, DataState, EmptyState, Input, Modal, PageHeader, Select, Table, TBody, TD, TH, THead, TR, useToast } from '../components/ui'
+import { Badge, Button, Card, ConfirmDialog, DataState, EmptyState, Input, Modal, PageHeader, Select, Spinner, Table, TBody, TD, TH, THead, TR, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
+import { SYMBOLOGY_ICONS, resolveSymbologyIcon } from '../lib/symbologyIcons'
+import { mediaUrl } from '../theme/branding'
 
 const GEOMETRY_ICON: Record<GeometryType, typeof MapPin> = { Point: MapPin, LineString: Spline, Polygon: Square }
 const GEOMETRY_LABEL: Record<GeometryType, string> = { Point: 'Point', LineString: 'Line', Polygon: 'Polygon' }
@@ -45,7 +47,7 @@ export function SymbologyPage() {
     <div className="flex flex-col gap-5">
       <PageHeader
         title="Symbology"
-        subtitle="Named point, line, and polygon drawing tools with a color. Assign them to a project — surveys can only draw with what's assigned."
+        subtitle="Named point, line, and polygon drawing tools with a color and — for points — an icon of your choice. Assign them to a project — surveys can only draw with what's assigned."
         action={
           canManage && (
             <Button leftIcon={<Plus size={16} />} onClick={openCreate}>
@@ -81,18 +83,26 @@ export function SymbologyPage() {
             </THead>
             <TBody>
               {symbologies.map((s) => {
-                const Icon = GEOMETRY_ICON[s.geometryType]
+                const GeometryIcon = GEOMETRY_ICON[s.geometryType]
+                const PointIcon = resolveSymbologyIcon(s.icon)
+                const customIconSrc = mediaUrl(s.iconUrl)
                 return (
                   <TR key={s.id}>
                     <TD>
                       <div className="flex items-center gap-2.5">
-                        <span className="h-4 w-4 shrink-0 rounded-full ring-2 ring-white" style={{ backgroundColor: s.color, boxShadow: '0 0 0 1px rgba(30,36,49,0.12)' }} />
+                        {s.geometryType === 'Point' ? (
+                          <span className="grid h-6 w-6 shrink-0 place-items-center overflow-hidden rounded-full text-white" style={{ backgroundColor: s.color, boxShadow: '0 0 0 1px rgba(30,36,49,0.12)' }}>
+                            {customIconSrc ? <img src={customIconSrc} alt="" className="h-full w-full object-cover" /> : <PointIcon size={13} strokeWidth={2.25} />}
+                          </span>
+                        ) : (
+                          <span className="h-4 w-4 shrink-0 rounded-full ring-2 ring-white" style={{ backgroundColor: s.color, boxShadow: '0 0 0 1px rgba(30,36,49,0.12)' }} />
+                        )}
                         <span className="font-semibold text-ink">{s.name}</span>
                       </div>
                     </TD>
                     <TD>
                       <Badge tone="neutral">
-                        <Icon size={12} />
+                        <GeometryIcon size={12} />
                         {GEOMETRY_LABEL[s.geometryType]}
                       </Badge>
                     </TD>
@@ -146,9 +156,18 @@ function SymbologyModal({
   onDone: () => void
   pushToast: (m: string, t?: 'success' | 'error' | 'info') => void
 }) {
+  const queryClient = useQueryClient()
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
   const [name, setName] = useState(editing?.name ?? '')
   const [geometryType, setGeometryType] = useState<GeometryType>(editing?.geometryType ?? 'Point')
   const [color, setColor] = useState(editing?.color ?? '#2f4fb4')
+  const [icon, setIcon] = useState<string | null>(editing?.icon ?? null)
+  const [iconUrl, setIconUrl] = useState<string | null>(editing?.iconUrl ?? null)
+  // A file picked before the symbology exists yet (creation flow) — held
+  // locally and uploaded right after the create call succeeds.
+  const [pendingFile, setPendingFile] = useState<File | null>(null)
+  const [pendingPreview, setPendingPreview] = useState<string | null>(null)
 
   const editingId = editing?.id ?? null
   const [lastEditingId, setLastEditingId] = useState<string | null>(editingId)
@@ -157,10 +176,21 @@ function SymbologyModal({
     setName(editing?.name ?? '')
     setGeometryType(editing?.geometryType ?? 'Point')
     setColor(editing?.color ?? '#2f4fb4')
+    setIcon(editing?.icon ?? null)
+    setIconUrl(editing?.iconUrl ?? null)
+    setPendingFile(null)
+    setPendingPreview(null)
   }
 
   const save = useMutation({
-    mutationFn: () => (editing ? symbologiesApi.update(editing.id, { name, color }) : symbologiesApi.create({ name, geometryType, color })),
+    mutationFn: async () => {
+      if (editing) {
+        return symbologiesApi.update(editing.id, { name, color, icon: geometryType === 'Point' ? icon : null })
+      }
+      const created = await symbologiesApi.create({ name, geometryType, color, icon: geometryType === 'Point' ? icon : null })
+      if (pendingFile) await symbologiesApi.uploadIcon(created.id, pendingFile)
+      return created
+    },
     onSuccess: () => {
       pushToast(editing ? 'Symbology updated' : 'Symbology created', 'success')
       onDone()
@@ -168,12 +198,58 @@ function SymbologyModal({
     onError: (err) => pushToast(err instanceof ApiError ? err.message : 'Failed to save symbology', 'error'),
   })
 
+  const uploadIcon = useMutation({
+    mutationFn: (file: File) => symbologiesApi.uploadIcon(editing!.id, file),
+    onSuccess: (updated) => {
+      setIconUrl(updated.iconUrl)
+      setIcon(null)
+      pushToast('Custom icon uploaded', 'success')
+      queryClient.invalidateQueries({ queryKey: ['symbologies'] })
+    },
+    onError: (err) => pushToast(err instanceof ApiError ? err.message : 'Failed to upload icon', 'error'),
+  })
+
+  const removeCustomIcon = useMutation({
+    mutationFn: () => symbologiesApi.removeIcon(editing!.id),
+    onSuccess: () => {
+      setIconUrl(null)
+      pushToast('Custom icon removed', 'success')
+      queryClient.invalidateQueries({ queryKey: ['symbologies'] })
+    },
+    onError: (err) => pushToast(err instanceof ApiError ? err.message : 'Failed to remove icon', 'error'),
+  })
+
+  function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    if (editing) {
+      uploadIcon.mutate(file)
+      return
+    }
+    // Not saved yet — hold the file and preview it locally; it uploads once
+    // the symbology itself is created.
+    if (pendingPreview) URL.revokeObjectURL(pendingPreview)
+    setPendingFile(file)
+    setPendingPreview(URL.createObjectURL(file))
+    setIcon(null)
+  }
+
+  function clearPendingFile() {
+    if (pendingPreview) URL.revokeObjectURL(pendingPreview)
+    setPendingFile(null)
+    setPendingPreview(null)
+  }
+
+  const customIconPreview = iconUrl ? mediaUrl(iconUrl) : pendingPreview
+
   return (
     <Modal
       open={open}
       onClose={onClose}
+      size="lg"
       title={editing ? `Edit ${editing.name}` : 'New Symbology'}
-      subtitle={editing ? undefined : 'Pick a geometry type and color — surveys will draw with exactly this once you assign it to a project.'}
+      subtitle={editing ? undefined : 'Pick a geometry type, a color, and — for points — an icon. Surveys will draw with exactly this once you assign it to a project.'}
       footer={
         <>
           <Button variant="outline" onClick={onClose}>Cancel</Button>
@@ -204,6 +280,57 @@ function SymbologyModal({
             <Input value={color} onChange={(e) => setColor(e.target.value)} containerClassName="flex-1" />
           </div>
         </div>
+
+        {geometryType === 'Point' && (
+          <div>
+            <label className="mb-1.5 block text-sm font-semibold text-slate-700">Icon</label>
+            <p className="mb-2 text-xs text-muted">Your choice — pick whatever best represents this asset on the map, or upload your own.</p>
+            <div className="grid grid-cols-8 gap-1.5 rounded-lg border border-slate-200 p-2 sm:grid-cols-10">
+              {SYMBOLOGY_ICONS.map(({ key, label, icon: IconOption }) => {
+                const active = !iconUrl && icon === key
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    title={label}
+                    onClick={() => {
+                      setIcon(active ? null : key)
+                      setIconUrl(null)
+                    }}
+                    className={`grid aspect-square place-items-center rounded-lg border transition-colors ${
+                      active ? 'border-primary-600 bg-primary-600 text-white' : 'border-transparent text-slate-500 hover:bg-slate-100'
+                    }`}
+                  >
+                    <IconOption size={16} />
+                  </button>
+                )
+              })}
+            </div>
+
+            <div className="mt-3 flex items-center gap-3">
+              <input ref={fileInputRef} type="file" accept="image/*" onChange={onFileChange} className="hidden" />
+              {customIconPreview ? (
+                <>
+                  <img src={customIconPreview} alt="Custom icon" className="h-10 w-10 rounded-full border border-slate-200 object-cover" />
+                  <span className="text-xs font-medium text-ink">{pendingFile ? 'Custom icon ready to upload' : 'Using a custom uploaded icon'}</span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    leftIcon={removeCustomIcon.isPending ? <Spinner className="h-3.5 w-3.5" /> : <X size={14} />}
+                    onClick={() => (pendingFile ? clearPendingFile() : removeCustomIcon.mutate())}
+                    disabled={removeCustomIcon.isPending}
+                  >
+                    Remove
+                  </Button>
+                </>
+              ) : (
+                <Button size="sm" variant="outline" leftIcon={<Upload size={14} />} onClick={() => fileInputRef.current?.click()} loading={uploadIcon.isPending}>
+                  Upload Custom Icon
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </Modal>
   )
