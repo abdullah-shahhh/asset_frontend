@@ -28,6 +28,8 @@ import {
   Bell,
   LogOut,
   AlertTriangle,
+  Zap,
+  Wrench,
 } from 'lucide-react'
 import {
   networkAssetsApi,
@@ -112,6 +114,17 @@ const GEOMETRY_LABEL: Record<GeometryType, string> = { Point: 'Point', LineStrin
 // network diagram — everything else (handholes, poles, ONTs...) is numerous
 // enough that always-on labels would just be clutter.
 const LABELED_SYMBOLOGY_NAMES = new Set(['Fiber Distribution Hub', 'Manhole'])
+
+// Demo fault simulator — picks a random reason from a realistic OFC fault pool.
+const FAULT_REASONS = [
+  'Fiber cut detected — signal loss reported by NOC monitoring',
+  'Vehicle strike on aerial cable near utility pole',
+  'Rodent damage suspected at mid-span',
+  'Cable severed during third-party excavation nearby',
+  'Water ingress at splice enclosure — signal degradation',
+  'Storm damage — downed line reported',
+  'Connector failure at termination point',
+]
 
 type Tool = 'point' | 'line' | 'polygon' | 'measure-distance' | 'measure-area' | null
 type BasemapStyle = 'dark' | 'bright'
@@ -264,6 +277,7 @@ export function MapDashboardPage() {
     { label: 'Cables', type: 'LineString' },
     { label: 'Areas', type: 'Polygon' },
   ]
+  const activeFaults = (assetsQuery.data?.featureCollection.features ?? []).filter((f) => f.properties.attributes?.faultActive)
 
   const invalidateAssets = () => queryClient.invalidateQueries({ queryKey: ['network-assets'] })
 
@@ -308,6 +322,48 @@ export function MapDashboardPage() {
       invalidateAssets()
     },
     onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to remove asset', 'error'),
+  })
+
+  // Demo fault simulator — flags a random healthy cable as faulted, right on
+  // the live map, so a review-and-fix workflow can be demonstrated end to end.
+  const [resolvingFault, setResolvingFault] = useState(false)
+  const [fixReason, setFixReason] = useState('')
+  useEffect(() => {
+    setResolvingFault(false)
+    setFixReason('')
+  }, [selectedFeature?.id])
+
+  const simulateFault = useMutation({
+    mutationFn: async () => {
+      const candidates = (assetsQuery.data?.featureCollection.features ?? []).filter(
+        (f) => f.geometry.type === 'LineString' && f.properties.status === 'approved' && !f.properties.attributes?.faultActive,
+      )
+      if (!candidates.length) throw new Error('No healthy cable segments available to simulate a fault on')
+      const target = candidates[Math.floor(Math.random() * candidates.length)]
+      const reason = FAULT_REASONS[Math.floor(Math.random() * FAULT_REASONS.length)]
+      await networkAssetsApi.update(target.id, { attributes: { faultActive: true, faultReason: reason, faultReportedAt: new Date().toISOString() } })
+      return { target, reason }
+    },
+    onSuccess: ({ target, reason }) => {
+      push(`Fault reported: ${target.properties.symbology?.name ?? 'Cable'} — ${reason}`, 'error')
+      invalidateAssets()
+    },
+    onError: (err) => push(err instanceof Error ? err.message : 'Failed to simulate a fault', 'error'),
+  })
+
+  const resolveFault = useMutation({
+    mutationFn: () => {
+      if (!selectedFeature) throw new Error('No asset selected')
+      return networkAssetsApi.update(selectedFeature.id, { attributes: { faultActive: false, faultResolvedReason: fixReason, faultResolvedAt: new Date().toISOString() } })
+    },
+    onSuccess: () => {
+      push('Fault marked as fixed', 'success')
+      setResolvingFault(false)
+      setFixReason('')
+      setSelectedFeature(null)
+      invalidateAssets()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to update fault', 'error'),
   })
 
   const saveGeometry = useMutation({
@@ -521,11 +577,16 @@ export function MapDashboardPage() {
 
     const fc: GeoJSON.FeatureCollection = {
       ...rawFc,
-      features: rawFc.features.filter((f) => !hiddenSymbologyIds.has(f.properties.symbologyId ?? '')),
+      features: rawFc.features
+        .filter((f) => !hiddenSymbologyIds.has(f.properties.symbologyId ?? ''))
+        // A simulated fault overrides the symbology color with red and marks
+        // the feature so the line-width expression below can thicken it.
+        .map((f) => (f.properties.attributes?.faultActive ? { ...f, properties: { ...f.properties, color: '#ef4444', faulted: true } } : f)),
     } as GeoJSON.FeatureCollection
 
     const symbologyColor = ['coalesce', ['get', 'color'], FALLBACK_COLOR] as unknown as maplibregl.ExpressionSpecification
     const statusOpacity = ['match', ['get', 'status'], 'rejected', 0.3, 'pending', 0.65, 1] as unknown as maplibregl.ExpressionSpecification
+    const lineWidth = ['case', ['==', ['get', 'faulted'], true], 7, 5] as unknown as maplibregl.ExpressionSpecification
 
     const applyData = () => {
       const source = map.getSource('assets') as maplibregl.GeoJSONSource | undefined
@@ -565,7 +626,7 @@ export function MapDashboardPage() {
         source: 'assets',
         filter: ['==', ['geometry-type'], 'LineString'],
         layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: { 'line-color': symbologyColor, 'line-width': 5, 'line-opacity': statusOpacity },
+        paint: { 'line-color': symbologyColor, 'line-width': lineWidth, 'line-opacity': statusOpacity },
       })
       const layers = ['assets-lines', 'assets-polygons']
       if (assetsClickHandlerRef.current) {
@@ -654,6 +715,48 @@ export function MapDashboardPage() {
     // may already have fired (which left markers permanently un-rendered).
     apply()
   }, [assetsQuery.data, editingFeature?.id, hiddenSymbologyIds])
+
+  // Pulsing alert marker at the midpoint of every actively-faulted cable —
+  // the dramatic "something's wrong here" cue for the demo fault simulator.
+  const faultMarkersRef = useRef<maplibregl.Marker[]>([])
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    faultMarkersRef.current.forEach((m) => m.remove())
+    faultMarkersRef.current = []
+
+    for (const f of activeFaults) {
+      if (f.geometry.type !== 'LineString') continue
+      const coords = f.geometry.coordinates as [number, number][]
+      const mid = coords[Math.floor(coords.length / 2)]
+      const el = document.createElement('div')
+      el.className = 'fault-marker'
+      el.style.cssText = [
+        'width:24px',
+        'height:24px',
+        'border-radius:9999px',
+        'background:#ef4444',
+        'border:2.5px solid #ffffff',
+        'display:flex',
+        'align-items:center',
+        'justify-content:center',
+        'cursor:pointer',
+      ].join(';')
+      el.innerHTML = renderToStaticMarkup(<AlertTriangle size={13} color="#ffffff" strokeWidth={2.75} />)
+      el.onclick = (e) => {
+        e.stopPropagation()
+        setSelectedFeature(f)
+      }
+      const marker = new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat(mid).addTo(map)
+      faultMarkersRef.current.push(marker)
+    }
+
+    return () => {
+      faultMarkersRef.current.forEach((m) => m.remove())
+      faultMarkersRef.current = []
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assetsQuery.data])
 
   // Geometry-editing handles — a draggable marker per vertex (with a delete
   // badge once above the minimum vertex count) plus a smaller midpoint
@@ -847,6 +950,29 @@ export function MapDashboardPage() {
           <div className="mx-1.5 h-5 w-px bg-white/10" />
           <ToolbarButton disabled={!!editingFeature} onClick={() => setImportOpen(true)} icon={<Upload size={15} />} label="Import" />
           <ToolbarButton disabled={!!editingFeature} onClick={() => setExportOpen(true)} icon={<Download size={15} />} label="Export" />
+
+          {canApprove && (
+            <>
+              <div className="mx-1.5 h-5 w-px bg-white/10" />
+              <ToolbarButton disabled={!!editingFeature || simulateFault.isPending || !activeProjectId} onClick={() => simulateFault.mutate()} icon={<Zap size={15} />} label="Simulate Fault" />
+            </>
+          )}
+
+          {activeFaults.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                const fault = activeFaults[0]
+                setSelectedFeature(fault)
+                const coords = fault.geometry.type === 'LineString' ? (fault.geometry.coordinates as [number, number][])[Math.floor((fault.geometry.coordinates as [number, number][]).length / 2)] : undefined
+                if (coords && mapRef.current) mapRef.current.flyTo({ center: coords, zoom: 17, duration: 600 })
+              }}
+              className="ml-1.5 flex items-center gap-1.5 rounded-md bg-danger-600 px-2.5 py-1 text-xs font-bold text-white shadow-sm transition-colors hover:bg-danger-700"
+            >
+              <AlertTriangle size={13} />
+              {activeFaults.length} Active Fault{activeFaults.length === 1 ? '' : 's'}
+            </button>
+          )}
 
           <div className="flex-1" />
           <button type="button" title="Notifications" className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-slate-300 transition-colors hover:bg-white/10 hover:text-white">
@@ -1068,14 +1194,42 @@ export function MapDashboardPage() {
                   <Badge tone={selectedFeature.properties.status === 'approved' ? 'success' : selectedFeature.properties.status === 'rejected' ? 'danger' : 'warning'} className="mb-3">
                     {selectedFeature.properties.status}
                   </Badge>
-                  {Object.keys(selectedFeature.properties.attributes || {}).length > 0 && (
-                    <div className="mb-3 space-y-1 rounded-lg bg-slate-50 p-2.5 text-xs">
-                      {Object.entries(selectedFeature.properties.attributes).map(([k, v]) => (
-                        <div key={k} className="flex justify-between gap-2">
-                          <span className="text-muted">{titleize(k)}</span>
-                          <span className="font-medium text-ink">{String(v)}</span>
+                  {Boolean(selectedFeature.properties.attributes?.faultActive) && (
+                    <div className="mb-3 rounded-lg border border-danger-200 bg-danger-50 p-2.5">
+                      <div className="mb-1 flex items-center gap-1.5 text-xs font-bold text-danger-700">
+                        <AlertTriangle size={13} />
+                        Active Fault
+                      </div>
+                      <p className="mb-2 text-xs text-danger-700">{String(selectedFeature.properties.attributes.faultReason)}</p>
+                      {!resolvingFault ? (
+                        <Button size="sm" variant="danger" leftIcon={<Wrench size={13} />} onClick={() => setResolvingFault(true)} className="w-full">
+                          Mark as Fixed
+                        </Button>
+                      ) : (
+                        <div className="flex flex-col gap-2">
+                          <Textarea placeholder="What fixed it? (required)" value={fixReason} onChange={(e) => setFixReason(e.target.value)} rows={2} />
+                          <div className="flex gap-2">
+                            <Button size="sm" variant="outline" onClick={() => setResolvingFault(false)} className="flex-1">
+                              Cancel
+                            </Button>
+                            <Button size="sm" onClick={() => resolveFault.mutate()} loading={resolveFault.isPending} disabled={!fixReason.trim()} className="flex-1">
+                              Confirm Fix
+                            </Button>
+                          </div>
                         </div>
-                      ))}
+                      )}
+                    </div>
+                  )}
+                  {Object.entries(selectedFeature.properties.attributes || {}).filter(([k]) => !k.startsWith('fault')).length > 0 && (
+                    <div className="mb-3 space-y-1 rounded-lg bg-slate-50 p-2.5 text-xs">
+                      {Object.entries(selectedFeature.properties.attributes)
+                        .filter(([k]) => !k.startsWith('fault'))
+                        .map(([k, v]) => (
+                          <div key={k} className="flex justify-between gap-2">
+                            <span className="text-muted">{titleize(k)}</span>
+                            <span className="font-medium text-ink">{String(v)}</span>
+                          </div>
+                        ))}
                     </div>
                   )}
                   {selectedFeature.properties.status === 'rejected' && selectedFeature.properties.rejectionReason && (

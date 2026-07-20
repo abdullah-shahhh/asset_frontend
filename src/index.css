@@ -169,3 +169,18 @@ button:disabled {
 .animate-pop-in {
   animation: pop-in 0.2s ease-out;
 }
+
+@keyframes fault-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.65);
+  }
+  70% {
+    box-shadow: 0 0 0 16px rgba(239, 68, 68, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+  }
+}
+.fault-marker {
+  animation: fault-pulse 1.6s ease-out infinite;
+}
