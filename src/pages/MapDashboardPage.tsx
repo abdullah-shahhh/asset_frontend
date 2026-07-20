@@ -249,13 +249,13 @@ export function MapDashboardPage() {
 
   // Distinct symbologies actually present on the map right now — drives the layers panel.
   const symbologyLayers = (() => {
-    const seen = new Map<string, { id: string; name: string; color: string; geometryType: GeometryType; count: number }>()
+    const seen = new Map<string, { id: string; name: string; color: string; icon: string | null; iconUrl: string | null; geometryType: GeometryType; count: number }>()
     for (const f of assetsQuery.data?.featureCollection.features ?? []) {
       const sym = f.properties.symbology
       if (!sym) continue
       const existing = seen.get(sym.id)
       if (existing) existing.count += 1
-      else seen.set(sym.id, { id: sym.id, name: sym.name, color: sym.color, geometryType: f.properties.geometryType, count: 1 })
+      else seen.set(sym.id, { id: sym.id, name: sym.name, color: sym.color, icon: sym.icon, iconUrl: sym.iconUrl, geometryType: f.properties.geometryType, count: 1 })
     }
     return Array.from(seen.values()).sort((a, b) => a.name.localeCompare(b.name))
   })()
@@ -930,8 +930,10 @@ export function MapDashboardPage() {
           </div>
 
           {/* Symbology legend for the active project — grouped by kind, with a
-              live count of how many of each are on the map right now. */}
-          {activeProjectId && !!symbologyLayers.length && (
+              live count of how many of each are on the map right now. Hidden
+              while a side panel is open so the two can't collide on shorter
+              viewports. */}
+          {activeProjectId && !!symbologyLayers.length && !selectedFeature && !editingFeature && !showForm && (
             <Card className="absolute bottom-4 right-4 z-20 w-64 overflow-hidden !rounded-lg shadow-[var(--shadow-card-hover)]">
               <div className="flex items-center justify-between gap-1.5 border-b border-slate-100 bg-slate-50 px-3 py-1.5">
                 <span className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
@@ -955,7 +957,7 @@ export function MapDashboardPage() {
                             ) : type === 'Polygon' ? (
                               <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ backgroundColor: s.color, opacity: 0.5, boxShadow: `inset 0 0 0 1.5px ${s.color}` }} />
                             ) : (
-                              <span className="h-2.5 w-2.5 shrink-0 rounded-full ring-2 ring-white" style={{ backgroundColor: s.color, boxShadow: '0 0 0 1px rgba(30,36,49,0.12)' }} />
+                              <LegendPointSwatch color={s.color} icon={s.icon} iconUrl={s.iconUrl} />
                             )}
                             <span className="min-w-0 flex-1 truncate">{s.name}</span>
                             <span className="tabular-nums text-slate-400">{s.count}</span>
@@ -1213,6 +1215,18 @@ function ToolbarButton({ icon, label, active, disabled, onClick }: { icon: React
     >
       {icon}
     </button>
+  )
+}
+
+/** Legend swatch for a Point symbology — a small preview of the actual
+ * marker (its real icon, or custom image) rather than a plain color dot. */
+function LegendPointSwatch({ color, icon, iconUrl }: { color: string; icon: string | null; iconUrl: string | null }) {
+  const customSrc = mediaUrl(iconUrl)
+  const Icon = resolveSymbologyIcon(icon)
+  return (
+    <span className="grid h-4 w-4 shrink-0 place-items-center overflow-hidden rounded-full ring-2 ring-white" style={{ backgroundColor: color, boxShadow: '0 0 0 1px rgba(30,36,49,0.12)' }}>
+      {customSrc ? <img src={customSrc} alt="" className="h-full w-full object-cover" /> : <Icon size={9} color="#ffffff" strokeWidth={2.5} />}
+    </span>
   )
 }
 
