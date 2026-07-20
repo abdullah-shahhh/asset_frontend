@@ -85,6 +85,7 @@ export interface GeoJsonGeometry {
 export interface NetworkAssetProperties {
   id: string
   projectId: string
+  project: { id: string; name: string } | null
   symbologyId: string | null
   symbology: { id: string; name: string; key: string; color: string; icon: string | null; iconUrl: string | null } | null
   color: string | null
@@ -95,8 +96,10 @@ export interface NetworkAssetProperties {
   attributes: Record<string, unknown>
   status: AssetStatus
   createdByUserId: string | null
+  createdBy: { id: string; name: string; email: string } | null
   reviewedByUserId: string | null
   reviewedAt: string | null
+  rejectionReason: string | null
   createdAt: string
   updatedAt: string
 }

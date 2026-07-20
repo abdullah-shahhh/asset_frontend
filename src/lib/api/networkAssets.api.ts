@@ -33,6 +33,7 @@ export const networkAssetsApi = {
   create: (payload: CreateNetworkAssetPayload) => api.post<NetworkAssetFeature>('/v1/org/network-assets', payload),
   update: (id: string, payload: Partial<CreateNetworkAssetPayload>) =>
     api.patch<NetworkAssetFeature>(`/v1/org/network-assets/${id}`, payload),
+  remove: (id: string) => api.del<null>(`/v1/org/network-assets/${id}`),
   approve: (id: string) => api.post<NetworkAssetFeature>(`/v1/org/network-assets/${id}/approve`),
   reject: (id: string, reason?: string) =>
     api.post<NetworkAssetFeature>(`/v1/org/network-assets/${id}/reject`, { reason }),

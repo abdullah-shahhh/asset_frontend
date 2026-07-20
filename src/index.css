@@ -87,28 +87,35 @@ button:disabled {
 }
 
 .maplibregl-map {
-  border-radius: var(--radius-card);
+  border-radius: 0;
 }
 
-/* Recolor MapLibre's built-in controls to match the app's card language
-   instead of the library's default flat-white squares. */
+/* Dark "engineering console" chrome for MapLibre's built-in controls —
+   matches the map toolbar/status bar rather than the library's default
+   flat-white squares, so the whole control layer reads as one system. */
 .maplibregl-ctrl-group {
-  border-radius: 0.75rem !important;
+  border-radius: 0.5rem !important;
   overflow: hidden;
-  border: 1px solid rgba(30, 36, 49, 0.08) !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
   box-shadow: var(--shadow-card-hover) !important;
-  background: rgba(255, 255, 255, 0.97) !important;
+  background: rgba(19, 28, 61, 0.92) !important;
   backdrop-filter: blur(6px);
 }
 .maplibregl-ctrl-group button {
-  width: 34px !important;
-  height: 34px !important;
+  width: 30px !important;
+  height: 30px !important;
+}
+.maplibregl-ctrl-group button .maplibregl-ctrl-icon {
+  filter: invert(1) brightness(1.6);
 }
 .maplibregl-ctrl-group button + button {
-  border-top: 1px solid rgba(30, 36, 49, 0.06) !important;
+  border-top: 1px solid rgba(255, 255, 255, 0.08) !important;
 }
 .maplibregl-ctrl-group button:hover {
-  background-color: var(--color-primary-50) !important;
+  background-color: rgba(255, 255, 255, 0.1) !important;
+}
+.maplibregl-ctrl-geolocate .maplibregl-ctrl-icon {
+  filter: invert(1) brightness(1.6);
 }
 .maplibregl-ctrl-scale {
   border: 2px solid rgba(255, 255, 255, 0.85) !important;

@@ -16,9 +16,18 @@ import {
   ThumbsDown,
   Crosshair,
   Layers,
+  Layers3,
   FolderKanban,
   PenLine,
   Save,
+  Ruler,
+  Pentagon,
+  Moon,
+  Sun,
+  Trash2,
+  Bell,
+  LogOut,
+  AlertTriangle,
 } from 'lucide-react'
 import {
   networkAssetsApi,
@@ -30,40 +39,55 @@ import {
   type GeometryType,
   type NetworkAssetFeature,
 } from '../lib/api'
-import { BASEMAP_STYLE, mapifyitTransformRequest } from '../lib/maps'
-import { Badge, Button, Card, Modal, Select, Spinner, Textarea, useToast } from '../components/ui'
+import { TILES_BASE, mapifyitTransformRequest } from '../lib/maps'
+import { Badge, Button, Card, Checkbox, ConfirmDialog, Dropdown, Modal, Select, Spinner, Textarea, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
 import { resolveSymbologyIcon } from '../lib/symbologyIcons'
 import { mediaUrl } from '../theme/branding'
 
 const FALLBACK_COLOR = '#64748b'
 
-/** Paint a point marker's content element: colored badge with either the
- * symbology's chosen icon or, if the org uploaded one, their own custom image. */
+function hexToRgba(hex: string, alpha: number): string {
+  const clean = hex.replace('#', '')
+  const r = parseInt(clean.substring(0, 2), 16)
+  const g = parseInt(clean.substring(2, 4), 16)
+  const b = parseInt(clean.substring(4, 6), 16)
+  return `rgba(${r},${g},${b},${alpha})`
+}
+
+/** Paint a point marker's content element: colored badge (with a soft glow
+ * in the symbology's color) holding either the symbology's chosen icon or,
+ * if the org uploaded one, their own custom image. A small status badge —
+ * amber dot for pending, red warning triangle for rejected — overlays the
+ * corner so problem submissions read at a glance without opening anything. */
 function paintPointMarker(el: HTMLDivElement, color: string, iconKey: string | null, iconUrl: string | null, status: string) {
-  const ring = status === 'rejected' ? '#ef4444' : '#ffffff'
-  const opacity = status === 'rejected' ? 0.55 : status === 'pending' ? 0.85 : 1
   el.style.cssText = [
-    'width:26px',
-    'height:26px',
+    'width:30px',
+    'height:30px',
     'border-radius:9999px',
     `background:${color}`,
-    `border:2px solid ${ring}`,
-    'box-shadow:0 1px 4px rgba(15,23,42,.35)',
+    'border:2.5px solid #ffffff',
+    `box-shadow:0 0 0 4px ${hexToRgba(color, 0.2)}, 0 2px 6px rgba(0,0,0,.45)`,
     'display:flex',
     'align-items:center',
     'justify-content:center',
-    'overflow:hidden',
+    'overflow:visible',
     'cursor:pointer',
-    `opacity:${opacity}`,
+    'position:relative',
+    `opacity:${status === 'rejected' ? 0.65 : 1}`,
   ].join(';')
   const customSrc = mediaUrl(iconUrl)
-  if (customSrc) {
-    el.innerHTML = `<img src="${customSrc}" alt="" style="width:100%;height:100%;object-fit:cover;pointer-events:none" />`
-  } else {
-    const Icon = resolveSymbologyIcon(iconKey)
-    el.innerHTML = renderToStaticMarkup(<Icon size={13} color="#ffffff" strokeWidth={2.5} />)
-  }
+  const Icon = resolveSymbologyIcon(iconKey)
+  const iconHtml = customSrc
+    ? `<img src="${customSrc}" alt="" style="width:100%;height:100%;border-radius:9999px;object-fit:cover;pointer-events:none" />`
+    : renderToStaticMarkup(<Icon size={14} color="#ffffff" strokeWidth={2.5} />)
+  const badge =
+    status === 'rejected'
+      ? `<span style="position:absolute;top:-6px;right:-6px;width:16px;height:16px;border-radius:9999px;background:#ef4444;border:2px solid #0a0e1f;display:flex;align-items:center;justify-content:center;">${renderToStaticMarkup(<AlertTriangle size={9} color="#ffffff" strokeWidth={3} />)}</span>`
+      : status === 'pending'
+        ? '<span style="position:absolute;top:-2px;right:-2px;width:11px;height:11px;border-radius:9999px;background:#f59e0b;border:2px solid #0a0e1f;"></span>'
+        : ''
+  el.innerHTML = iconHtml + badge
 }
 /** Paint a draggable vertex handle used while editing an existing shape's
  * geometry. Carries its own delete badge (as a child element with its own
@@ -84,16 +108,89 @@ function paintMidpointMarker(el: HTMLDivElement) {
 
 const GEOMETRY_LABEL: Record<GeometryType, string> = { Point: 'Point', LineString: 'Line', Polygon: 'Polygon' }
 
-type Tool = 'point' | 'line' | 'polygon' | null
+// Hub-type structures worth naming directly on the map, like a real fiber
+// network diagram — everything else (handholes, poles, ONTs...) is numerous
+// enough that always-on labels would just be clutter.
+const LABELED_SYMBOLOGY_NAMES = new Set(['Fiber Distribution Hub', 'Manhole'])
+
+type Tool = 'point' | 'line' | 'polygon' | 'measure-distance' | 'measure-area' | null
+type BasemapStyle = 'dark' | 'bright'
+
+const METERS_PER_MILE = 1609.344
+const SQMETERS_PER_ACRE = 4046.8564224
+
+/** Bounding box covering every coordinate in a set of features — used to
+ * frame the map on a project's data once it loads. */
+function featureCollectionBounds(features: NetworkAssetFeature[]): [[number, number], [number, number]] {
+  let minLng = Infinity
+  let minLat = Infinity
+  let maxLng = -Infinity
+  let maxLat = -Infinity
+  const visit = (coords: unknown): void => {
+    if (Array.isArray(coords) && typeof coords[0] === 'number') {
+      const [lng, lat] = coords as [number, number]
+      minLng = Math.min(minLng, lng)
+      maxLng = Math.max(maxLng, lng)
+      minLat = Math.min(minLat, lat)
+      maxLat = Math.max(maxLat, lat)
+    } else if (Array.isArray(coords)) {
+      coords.forEach(visit)
+    }
+  }
+  features.forEach((f) => visit(f.geometry.coordinates))
+  return [
+    [minLng, minLat],
+    [maxLng, maxLat],
+  ]
+}
+
+/** Sum of great-circle distances between consecutive points, in meters. */
+function pathDistanceMeters(points: [number, number][]): number {
+  let total = 0
+  for (let i = 1; i < points.length; i++) total += haversineMeters(points[i - 1], points[i])
+  return total
+}
+function haversineMeters([lng1, lat1]: [number, number], [lng2, lat2]: [number, number]): number {
+  const R = 6371000
+  const toRad = (d: number) => (d * Math.PI) / 180
+  const dLat = toRad(lat2 - lat1)
+  const dLng = toRad(lng2 - lng1)
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+/** Planar shoelace area over a local equirectangular projection — accurate
+ * enough at survey/city scale without pulling in a full geodesy library. */
+function ringAreaSqMeters(points: [number, number][]): number {
+  if (points.length < 3) return 0
+  const lat0 = (points.reduce((s, p) => s + p[1], 0) / points.length) * (Math.PI / 180)
+  const projected = points.map(([lng, lat]) => [lng * 111320 * Math.cos(lat0), lat * 110540] as [number, number])
+  let sum = 0
+  for (let i = 0; i < projected.length; i++) {
+    const [x1, y1] = projected[i]
+    const [x2, y2] = projected[(i + 1) % projected.length]
+    sum += x1 * y2 - x2 * y1
+  }
+  return Math.abs(sum) / 2
+}
+function formatDistance(meters: number): string {
+  const feet = meters * 3.28084
+  return feet < 1000 ? `${feet.toFixed(0)} ft` : `${(meters / METERS_PER_MILE).toFixed(2)} mi`
+}
+function formatArea(sqMeters: number): string {
+  const acres = sqMeters / SQMETERS_PER_ACRE
+  return acres < 1 ? `${(sqMeters * 10.7639).toFixed(0)} sq ft` : `${acres.toFixed(2)} ac`
+}
 
 export function MapDashboardPage() {
   const mapContainer = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
   const queryClient = useQueryClient()
   const { push } = useToast()
-  const { hasPermission } = useAuth()
+  const { user, logout, hasPermission } = useAuth()
   const canApprove = hasPermission('assets.approve')
   const canEditGeometry = hasPermission('assets.update')
+  const canDelete = hasPermission('assets.delete')
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
 
   // Which project's symbologies the draw tools currently offer.
   const [activeProjectId, setActiveProjectId] = useState('')
@@ -117,13 +214,24 @@ export function MapDashboardPage() {
   const [importOpen, setImportOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
 
+  // Measurement tool (distance / area) — deliberately kept independent of the
+  // asset-drawing draft pipeline above so it can't get tangled with the
+  // submission-form flow.
+  const [measurePoints, setMeasurePoints] = useState<[number, number][]>([])
+
+  // Basemap switcher + per-symbology layer visibility.
+  const [basemapStyle, setBasemapStyle] = useState<BasemapStyle>('dark')
+  const [layersOpen, setLayersOpen] = useState(false)
+  const [hiddenSymbologyIds, setHiddenSymbologyIds] = useState<Set<string>>(new Set())
+
   // Status-bar telemetry.
   const [cursorLngLat, setCursorLngLat] = useState<{ lng: number; lat: number } | null>(null)
   const [zoom, setZoom] = useState(13)
 
   const assetsQuery = useQuery({
-    queryKey: ['network-assets', 'map'],
-    queryFn: () => networkAssetsApi.list({ limit: 500 }),
+    queryKey: ['network-assets', 'map', activeProjectId],
+    queryFn: () => networkAssetsApi.list({ projectId: activeProjectId, limit: 500 }),
+    enabled: !!activeProjectId,
   })
   const projectsQuery = useQuery({ queryKey: ['projects', 'all'], queryFn: () => projectsApi.list({ limit: 100 }) })
   const projectSymbologiesQuery = useQuery({
@@ -138,6 +246,24 @@ export function MapDashboardPage() {
   const lineSymbologies = projectSymbologies.filter((s) => s.geometryType === 'LineString')
   const polygonSymbologies = projectSymbologies.filter((s) => s.geometryType === 'Polygon')
   const eligibleSymbologies = draftGeometry?.type === 'LineString' ? lineSymbologies : draftGeometry?.type === 'Polygon' ? polygonSymbologies : pointSymbologies
+
+  // Distinct symbologies actually present on the map right now — drives the layers panel.
+  const symbologyLayers = (() => {
+    const seen = new Map<string, { id: string; name: string; color: string; geometryType: GeometryType; count: number }>()
+    for (const f of assetsQuery.data?.featureCollection.features ?? []) {
+      const sym = f.properties.symbology
+      if (!sym) continue
+      const existing = seen.get(sym.id)
+      if (existing) existing.count += 1
+      else seen.set(sym.id, { id: sym.id, name: sym.name, color: sym.color, geometryType: f.properties.geometryType, count: 1 })
+    }
+    return Array.from(seen.values()).sort((a, b) => a.name.localeCompare(b.name))
+  })()
+  const legendGroups: { label: string; type: GeometryType }[] = [
+    { label: 'Facilities', type: 'Point' },
+    { label: 'Cables', type: 'LineString' },
+    { label: 'Areas', type: 'Polygon' },
+  ]
 
   const invalidateAssets = () => queryClient.invalidateQueries({ queryKey: ['network-assets'] })
 
@@ -171,6 +297,17 @@ export function MapDashboardPage() {
       invalidateAssets()
     },
     onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to reject', 'error'),
+  })
+
+  const removeAsset = useMutation({
+    mutationFn: (id: string) => networkAssetsApi.remove(id),
+    onSuccess: () => {
+      push('Asset removed from the map', 'success')
+      setSelectedFeature(null)
+      setConfirmDeleteId(null)
+      invalidateAssets()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to remove asset', 'error'),
   })
 
   const saveGeometry = useMutation({
@@ -214,6 +351,7 @@ export function MapDashboardPage() {
     setDraftGeometry(null)
     setSymbologyId('')
     setNotes('')
+    setMeasurePoints([])
   }
 
   function finishShape() {
@@ -226,6 +364,9 @@ export function MapDashboardPage() {
   function undoLinePoint() {
     setLinePoints((pts) => pts.slice(0, -1))
   }
+  function undoMeasurePoint() {
+    setMeasurePoints((pts) => pts.slice(0, -1))
+  }
   function toggleTool(next: Exclude<Tool, null>) {
     const wasActive = tool === next
     resetDrawing()
@@ -233,23 +374,65 @@ export function MapDashboardPage() {
     if (!wasActive) setTool(next)
   }
 
+  function switchBasemap(style: BasemapStyle) {
+    if (style === basemapStyle) return
+    mapRef.current?.setStyle(`${TILES_BASE}/${style}`)
+    setBasemapStyle(style)
+  }
+
+  function toggleSymbologyVisibility(id: string) {
+    setHiddenSymbologyIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
   useEffect(() => {
     if (!mapContainer.current || mapRef.current) return
     const map = new maplibregl.Map({
       container: mapContainer.current,
-      style: BASEMAP_STYLE,
-      center: [-122.4194, 37.7749],
-      zoom: 13,
+      style: `${TILES_BASE}/dark`,
+      // Default view: the whole continental US, not zoomed into any one city.
+      bounds: [
+        [-125, 24.5],
+        [-66.9, 49.5],
+      ],
+      fitBoundsOptions: { padding: 20 },
       attributionControl: false,
+      canvasContextAttributes: { antialias: true },
       transformRequest: (url) => mapifyitTransformRequest(url),
     })
-    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right')
+    map.addControl(new maplibregl.NavigationControl({ showCompass: true, visualizePitch: false }), 'top-right')
+    map.addControl(new maplibregl.GeolocateControl({ positionOptions: { enableHighAccuracy: true }, trackUserLocation: true }), 'top-right')
     map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: 'imperial' }), 'bottom-left')
     map.on('mousemove', (e) => setCursorLngLat({ lng: e.lngLat.lng, lat: e.lngLat.lat }))
     map.on('mouseout', () => setCursorLngLat(null))
     map.on('zoom', () => setZoom(map.getZoom()))
+    // The initial bounds-fit sets the camera synchronously during
+    // construction, before this listener existed to catch its 'zoom' event.
+    setZoom(map.getZoom())
     mapRef.current = map
+
+    // The map container's width changes when the sidebar's collapse
+    // animation runs (AppShell's icon-rail transition) — that's a layout
+    // resize MapLibre's own window-resize listener never sees, and without
+    // an explicit resize() the canvas backing store stays mismatched with
+    // its CSS size, which renders as a blurry, stretched map. Debounced so
+    // it fires once after the CSS transition settles rather than on every
+    // intermediate frame — calling resize() mid-transition was aborting the
+    // style's initial sprite/tile requests.
+    let resizeTimer: ReturnType<typeof setTimeout>
+    const resizeObserver = new ResizeObserver(() => {
+      clearTimeout(resizeTimer)
+      resizeTimer = setTimeout(() => map.resize(), 250)
+    })
+    resizeObserver.observe(mapContainer.current)
+
     return () => {
+      clearTimeout(resizeTimer)
+      resizeObserver.disconnect()
       map.remove()
       mapRef.current = null
       pointMarkersRef.current.clear()
@@ -284,6 +467,8 @@ export function MapDashboardPage() {
         setDraftGeometry({ type: 'Point', coordinates: [e.lngLat.lng, e.lngLat.lat] })
       } else if ((tool === 'line' || tool === 'polygon') && !draftGeometry) {
         setLinePoints((pts) => [...pts, [e.lngLat.lng, e.lngLat.lat]])
+      } else if (tool === 'measure-distance' || tool === 'measure-area') {
+        setMeasurePoints((pts) => [...pts, [e.lngLat.lng, e.lngLat.lat]])
       }
     }
     map.on('click', onClick)
@@ -301,11 +486,43 @@ export function MapDashboardPage() {
     editingFeatureRef.current = editingFeature
   }, [editingFeature])
 
-  // Existing (submitted) assets layer — clicking one opens the review panel.
+  // Fly to a project's data the first time it loads after being selected —
+  // once per selection, not on every background refetch (e.g. after an
+  // approve/reject invalidates the query while the same project is active).
+  const lastFitProjectRef = useRef<string | null>(null)
   useEffect(() => {
     const map = mapRef.current
-    const fc = assetsQuery.data?.featureCollection
-    if (!map || !fc) return
+    const features = assetsQuery.data?.featureCollection.features
+    if (!map || !activeProjectId || !features?.length) return
+    if (lastFitProjectRef.current === activeProjectId) return
+    lastFitProjectRef.current = activeProjectId
+    map.fitBounds(featureCollectionBounds(features), { padding: 80, maxZoom: 17, duration: 800 })
+  }, [assetsQuery.data, activeProjectId])
+
+  // Existing (submitted) assets layer — clicking one opens the review panel.
+  // Re-runs on basemapStyle change too, since setStyle() wipes custom
+  // sources/layers and this re-adds them once the new style has loaded.
+  const assetsClickHandlerRef = useRef<((e: maplibregl.MapLayerMouseEvent) => void) | null>(null)
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const rawFc = assetsQuery.data?.featureCollection
+    if (!rawFc) {
+      // No project selected (or its data hasn't loaded yet) — keep the map
+      // clean rather than showing stale assets from a previously selected project.
+      const clear = () => {
+        const source = map.getSource('assets') as maplibregl.GeoJSONSource | undefined
+        source?.setData({ type: 'FeatureCollection', features: [] })
+      }
+      if (map.isStyleLoaded()) clear()
+      else map.once('style.load', clear)
+      return
+    }
+
+    const fc: GeoJSON.FeatureCollection = {
+      ...rawFc,
+      features: rawFc.features.filter((f) => !hiddenSymbologyIds.has(f.properties.symbologyId ?? '')),
+    } as GeoJSON.FeatureCollection
 
     const symbologyColor = ['coalesce', ['get', 'color'], FALLBACK_COLOR] as unknown as maplibregl.ExpressionSpecification
     const statusOpacity = ['match', ['get', 'status'], 'rejected', 0.3, 'pending', 0.65, 1] as unknown as maplibregl.ExpressionSpecification
@@ -313,10 +530,10 @@ export function MapDashboardPage() {
     const applyData = () => {
       const source = map.getSource('assets') as maplibregl.GeoJSONSource | undefined
       if (source) {
-        source.setData(fc as GeoJSON.FeatureCollection)
+        source.setData(fc)
         return
       }
-      map.addSource('assets', { type: 'geojson', data: fc as GeoJSON.FeatureCollection })
+      map.addSource('assets', { type: 'geojson', data: fc })
       map.addLayer({
         id: 'assets-polygons',
         type: 'fill',
@@ -325,13 +542,35 @@ export function MapDashboardPage() {
         paint: { 'fill-color': symbologyColor, 'fill-opacity': ['*', 0.35, statusOpacity], 'fill-outline-color': symbologyColor },
       })
       map.addLayer({
+        id: 'assets-polygons-outline',
+        type: 'line',
+        source: 'assets',
+        filter: ['==', ['geometry-type'], 'Polygon'],
+        layout: { 'line-join': 'round' },
+        paint: { 'line-color': symbologyColor, 'line-width': 2, 'line-opacity': statusOpacity },
+      })
+      // A soft halo beneath the main cable line gives routes the glowing,
+      // "highlighted circuit" look of a real fiber network map.
+      map.addLayer({
+        id: 'assets-lines-halo',
+        type: 'line',
+        source: 'assets',
+        filter: ['==', ['geometry-type'], 'LineString'],
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: { 'line-color': symbologyColor, 'line-width': 11, 'line-blur': 1.5, 'line-opacity': ['*', 0.22, statusOpacity] },
+      })
+      map.addLayer({
         id: 'assets-lines',
         type: 'line',
         source: 'assets',
         filter: ['==', ['geometry-type'], 'LineString'],
         layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: { 'line-color': symbologyColor, 'line-width': 4, 'line-opacity': statusOpacity },
+        paint: { 'line-color': symbologyColor, 'line-width': 5, 'line-opacity': statusOpacity },
       })
+      const layers = ['assets-lines', 'assets-polygons']
+      if (assetsClickHandlerRef.current) {
+        layers.forEach((id) => map.off('click', id, assetsClickHandlerRef.current!))
+      }
       const onFeatureClick = (e: maplibregl.MapLayerMouseEvent) => {
         if (editingFeatureRef.current) return
         const f = e.features?.[0]
@@ -339,7 +578,7 @@ export function MapDashboardPage() {
         const full = (fc as unknown as { features: NetworkAssetFeature[] }).features.find((x) => x.id === f.properties!.id)
         if (full) setSelectedFeature(full)
       }
-      const layers = ['assets-lines', 'assets-polygons']
+      assetsClickHandlerRef.current = onFeatureClick
       layers.forEach((id) => {
         map.on('click', id, onFeatureClick)
         map.on('mouseenter', id, () => (map.getCanvas().style.cursor = 'pointer'))
@@ -348,22 +587,28 @@ export function MapDashboardPage() {
     }
 
     if (map.isStyleLoaded()) applyData()
-    else map.once('load', applyData)
-  }, [assetsQuery.data])
+    else map.once('style.load', applyData)
+  }, [assetsQuery.data, hiddenSymbologyIds, basemapStyle])
 
   // Point assets render as icon markers (not a GPU circle layer) so each one
   // can show the symbology's chosen icon, not just a plain dot.
   const pointMarkersRef = useRef<Map<string, { marker: maplibregl.Marker; content: HTMLDivElement }>>(new Map())
   useEffect(() => {
     const map = mapRef.current
+    if (!map) return
     const features = assetsQuery.data?.featureCollection.features
-    if (!map || !features) return
+    if (!features) {
+      for (const entry of pointMarkersRef.current.values()) entry.marker.remove()
+      pointMarkersRef.current.clear()
+      return
+    }
 
     const apply = () => {
       const seen = new Set<string>()
       for (const feature of features) {
         if (feature.geometry.type !== 'Point') continue
         if (feature.id === editingFeature?.id) continue
+        if (hiddenSymbologyIds.has(feature.properties.symbologyId ?? '')) continue
         seen.add(feature.id)
         const [lng, lat] = feature.geometry.coordinates as [number, number]
         const color = feature.properties.color || FALLBACK_COLOR
@@ -377,7 +622,7 @@ export function MapDashboardPage() {
           }
         } else {
           const wrapper = document.createElement('div')
-          wrapper.style.cssText = 'display:inline-block;line-height:0'
+          wrapper.style.cssText = 'display:inline-flex;flex-direction:column;align-items:center;gap:3px;line-height:0'
           const content = document.createElement('div')
           paintPointMarker(content, color, feature.properties.icon, feature.properties.iconUrl, feature.properties.status)
           content.onclick = (e) => {
@@ -385,6 +630,13 @@ export function MapDashboardPage() {
             if (!editingFeatureRef.current) setSelectedFeature(feature)
           }
           wrapper.appendChild(content)
+          if (feature.properties.symbology && LABELED_SYMBOLOGY_NAMES.has(feature.properties.symbology.name)) {
+            const label = document.createElement('div')
+            label.textContent = feature.properties.symbology.name
+            label.style.cssText =
+              'pointer-events:none;white-space:nowrap;font-size:10px;font-weight:700;color:#e2e8f0;background:rgba(10,14,31,.85);padding:1px 6px;border-radius:4px;letter-spacing:.02em;line-height:1.5'
+            wrapper.appendChild(label)
+          }
           const marker = new maplibregl.Marker({ element: wrapper }).setLngLat([lng, lat]).addTo(map)
           pointMarkersRef.current.set(feature.id, { marker, content })
         }
@@ -397,9 +649,11 @@ export function MapDashboardPage() {
       }
     }
 
-    if (map.isStyleLoaded()) apply()
-    else map.once('load', apply)
-  }, [assetsQuery.data, editingFeature?.id])
+    // Unlike the GL sources/layers above, DOM markers don't depend on the
+    // style being loaded — call directly rather than gating on an event that
+    // may already have fired (which left markers permanently un-rendered).
+    apply()
+  }, [assetsQuery.data, editingFeature?.id, hiddenSymbologyIds])
 
   // Geometry-editing handles — a draggable marker per vertex (with a delete
   // badge once above the minimum vertex count) plus a smaller midpoint
@@ -520,39 +774,98 @@ export function MapDashboardPage() {
     }
 
     if (map.isStyleLoaded()) applyDraft()
-    else map.once('load', applyDraft)
-  }, [draftGeometry, linePoints, editingFeature, editVertices])
+    else map.once('style.load', applyDraft)
+  }, [draftGeometry, linePoints, editingFeature, editVertices, basemapStyle])
+
+  // Measurement layer — a distinct amber dashed style so it reads as a
+  // temporary annotation rather than a draft asset.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const isArea = tool === 'measure-area'
+    const ring = isArea && measurePoints.length >= 3 ? [...measurePoints, measurePoints[0]] : null
+
+    const fc: GeoJSON.FeatureCollection = {
+      type: 'FeatureCollection',
+      features: [
+        ...(ring ? [{ type: 'Feature' as const, geometry: { type: 'Polygon' as const, coordinates: [ring] }, properties: {} }] : []),
+        ...(measurePoints.length >= 2 ? [{ type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: ring ?? measurePoints }, properties: {} }] : []),
+        ...measurePoints.map((c) => ({ type: 'Feature' as const, geometry: { type: 'Point' as const, coordinates: c }, properties: {} })),
+      ],
+    }
+
+    const applyMeasure = () => {
+      const source = map.getSource('measure') as maplibregl.GeoJSONSource | undefined
+      if (source) {
+        source.setData(fc)
+        return
+      }
+      map.addSource('measure', { type: 'geojson', data: fc })
+      map.addLayer({ id: 'measure-fill', type: 'fill', source: 'measure', filter: ['==', ['geometry-type'], 'Polygon'], paint: { 'fill-color': '#f59e0b', 'fill-opacity': 0.15 } })
+      map.addLayer({ id: 'measure-line', type: 'line', source: 'measure', filter: ['==', ['geometry-type'], 'LineString'], layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#f59e0b', 'line-width': 2.5, 'line-dasharray': [2, 1.5] } })
+      map.addLayer({ id: 'measure-vertices', type: 'circle', source: 'measure', filter: ['==', ['geometry-type'], 'Point'], paint: { 'circle-radius': 4, 'circle-color': '#f59e0b', 'circle-stroke-width': 2, 'circle-stroke-color': '#ffffff' } })
+    }
+
+    if (map.isStyleLoaded()) applyMeasure()
+    else map.once('style.load', applyMeasure)
+  }, [measurePoints, tool, basemapStyle])
 
   const showForm = Boolean(draftGeometry)
   const canFinishShape = (tool === 'line' && linePoints.length >= 2) || (tool === 'polygon' && linePoints.length >= 3)
+  const measureDistance = tool === 'measure-distance' || tool === 'measure-area' ? pathDistanceMeters(tool === 'measure-area' && measurePoints.length >= 3 ? [...measurePoints, measurePoints[0]] : measurePoints) : 0
+  const measureArea = tool === 'measure-area' && measurePoints.length >= 3 ? ringAreaSqMeters(measurePoints) : 0
   const featureCount = assetsQuery.data?.featureCollection.features.length ?? 0
 
   return (
-    <div className="relative h-[calc(100vh-7rem)] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-[var(--shadow-card)]">
+    <div className="relative h-full w-full overflow-hidden bg-white">
       <div className="flex h-full flex-col">
-        <div className="flex h-14 shrink-0 items-center gap-1 border-b border-slate-200 bg-white px-3">
+        <div className="flex h-11 shrink-0 items-center gap-1 border-b border-black/30 bg-primary-950 px-2.5">
           <select
             value={activeProjectId}
             onChange={(e) => {
               setActiveProjectId(e.target.value)
               resetDrawing()
             }}
-            className="h-9 max-w-[11rem] rounded-lg border-0 bg-slate-50 px-2.5 text-sm font-semibold text-ink outline-none focus:ring-2 focus:ring-primary-500/30"
+            className="h-7 max-w-[10rem] rounded-md border border-white/10 bg-white/[0.06] px-2 text-xs font-semibold text-slate-100 outline-none focus:ring-2 focus:ring-primary-400/40"
           >
-            <option value="">Select project…</option>
+            <option value="" className="text-ink">
+              Select project…
+            </option>
             {(projectsQuery.data?.items ?? []).map((p) => (
-              <option key={p.id} value={p.id}>
+              <option key={p.id} value={p.id} className="text-ink">
                 {p.name}
               </option>
             ))}
           </select>
-          <div className="mx-1.5 h-6 w-px bg-slate-200" />
-          <ToolbarButton active={tool === 'point'} disabled={!pointSymbologies.length || !!editingFeature} onClick={() => toggleTool('point')} icon={<MapPin size={16} />} label={tool === 'point' ? 'Cancel' : 'Point'} />
-          <ToolbarButton active={tool === 'line'} disabled={!lineSymbologies.length || !!editingFeature} onClick={() => toggleTool('line')} icon={<Spline size={16} />} label={tool === 'line' ? 'Cancel' : 'Line'} />
-          <ToolbarButton active={tool === 'polygon'} disabled={!polygonSymbologies.length || !!editingFeature} onClick={() => toggleTool('polygon')} icon={<Square size={16} />} label={tool === 'polygon' ? 'Cancel' : 'Polygon'} />
-          <div className="mx-1.5 h-6 w-px bg-slate-200" />
-          <ToolbarButton disabled={!!editingFeature} onClick={() => setImportOpen(true)} icon={<Upload size={16} />} label="Import" />
-          <ToolbarButton disabled={!!editingFeature} onClick={() => setExportOpen(true)} icon={<Download size={16} />} label="Export" />
+          <div className="mx-1.5 h-5 w-px bg-white/10" />
+          <ToolbarButton active={tool === 'point'} disabled={!pointSymbologies.length || !!editingFeature} onClick={() => toggleTool('point')} icon={<MapPin size={15} />} label={tool === 'point' ? 'Cancel' : 'Point'} />
+          <ToolbarButton active={tool === 'line'} disabled={!lineSymbologies.length || !!editingFeature} onClick={() => toggleTool('line')} icon={<Spline size={15} />} label={tool === 'line' ? 'Cancel' : 'Line'} />
+          <ToolbarButton active={tool === 'polygon'} disabled={!polygonSymbologies.length || !!editingFeature} onClick={() => toggleTool('polygon')} icon={<Square size={15} />} label={tool === 'polygon' ? 'Cancel' : 'Polygon'} />
+          <div className="mx-1.5 h-5 w-px bg-white/10" />
+          <ToolbarButton active={tool === 'measure-distance'} disabled={!!editingFeature} onClick={() => toggleTool('measure-distance')} icon={<Ruler size={15} />} label={tool === 'measure-distance' ? 'Cancel' : 'Distance'} />
+          <ToolbarButton active={tool === 'measure-area'} disabled={!!editingFeature} onClick={() => toggleTool('measure-area')} icon={<Pentagon size={15} />} label={tool === 'measure-area' ? 'Cancel' : 'Area'} />
+          <div className="mx-1.5 h-5 w-px bg-white/10" />
+          <ToolbarButton disabled={!!editingFeature} onClick={() => setImportOpen(true)} icon={<Upload size={15} />} label="Import" />
+          <ToolbarButton disabled={!!editingFeature} onClick={() => setExportOpen(true)} icon={<Download size={15} />} label="Export" />
+
+          <div className="flex-1" />
+          <button type="button" title="Notifications" className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-slate-300 transition-colors hover:bg-white/10 hover:text-white">
+            <Bell size={15} />
+          </button>
+          <div className="mx-1 h-5 w-px bg-white/10" />
+          <Dropdown
+            align="right"
+            trigger={
+              <span className="flex items-center gap-2 rounded-md px-1 py-1 hover:bg-white/10">
+                <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-primary-600 text-[11px] font-bold text-white">{initials(user?.name)}</span>
+                <span className="hidden text-left lg:block">
+                  <span className="block text-xs font-semibold leading-tight text-white">{user?.name}</span>
+                  <span className="block text-[10px] text-slate-400">{user?.role}</span>
+                </span>
+              </span>
+            }
+            items={[{ label: 'Sign out', icon: <LogOut className="h-4 w-4" />, danger: true, onClick: logout }]}
+          />
         </div>
 
         <div className="relative min-h-0 flex-1">
@@ -562,20 +875,96 @@ export function MapDashboardPage() {
               reconciliation and MapLibre's direct DOM writes fight each other. */}
           <div ref={mapContainer} className="h-full w-full" />
 
-          {/* Symbology legend for the active project */}
-          {activeProjectId && !!projectSymbologies.length && (
-            <Card className="absolute bottom-4 right-4 z-20 max-w-xs overflow-hidden !rounded-xl shadow-[var(--shadow-card-hover)]">
-              <div className="flex items-center gap-1.5 border-b border-slate-100 bg-slate-50 px-3 py-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                <Layers size={12} />
-                Legend
+          {/* Basemap switcher + layers panel toggle */}
+          <div className="absolute left-3 top-3 z-20 flex flex-col items-start gap-2">
+            <div className="flex overflow-hidden rounded-lg border border-white/10 bg-primary-950/95 shadow-[var(--shadow-card-hover)] backdrop-blur">
+              <button
+                type="button"
+                onClick={() => switchBasemap('dark')}
+                title="Dark basemap"
+                className={`grid h-8 w-8 place-items-center transition-colors ${basemapStyle === 'dark' ? 'bg-primary-600 text-white' : 'text-slate-300 hover:bg-white/10'}`}
+              >
+                <Moon size={14} />
+              </button>
+              <div className="w-px bg-white/10" />
+              <button
+                type="button"
+                onClick={() => switchBasemap('bright')}
+                title="Bright basemap"
+                className={`grid h-8 w-8 place-items-center transition-colors ${basemapStyle === 'bright' ? 'bg-primary-600 text-white' : 'text-slate-300 hover:bg-white/10'}`}
+              >
+                <Sun size={14} />
+              </button>
+            </div>
+
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setLayersOpen((v) => !v)}
+                title="Layers"
+                className={`grid h-8 w-8 place-items-center rounded-lg border border-white/10 shadow-[var(--shadow-card-hover)] backdrop-blur transition-colors ${
+                  layersOpen ? 'bg-primary-600 text-white' : 'bg-primary-950/95 text-slate-300 hover:bg-white/10'
+                }`}
+              >
+                <Layers3 size={15} />
+              </button>
+              {layersOpen && (
+                <Card className="absolute left-0 top-10 z-20 w-56 overflow-hidden !rounded-lg shadow-[var(--shadow-card-hover)]">
+                  <div className="border-b border-slate-100 bg-slate-50 px-3 py-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">Layers</div>
+                  {symbologyLayers.length > 0 ? (
+                    <div className="max-h-64 overflow-y-auto p-2">
+                      {symbologyLayers.map((s) => (
+                        <div key={s.id} className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50">
+                          <Checkbox checked={!hiddenSymbologyIds.has(s.id)} onChange={() => toggleSymbologyVisibility(s.id)} />
+                          <span className="h-2.5 w-2.5 shrink-0 rounded-full ring-2 ring-white" style={{ backgroundColor: s.color, boxShadow: '0 0 0 1px rgba(30,36,49,0.12)' }} />
+                          <span className="truncate">{s.name}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="px-3 py-3 text-xs text-muted">No assets loaded yet.</p>
+                  )}
+                </Card>
+              )}
+            </div>
+          </div>
+
+          {/* Symbology legend for the active project — grouped by kind, with a
+              live count of how many of each are on the map right now. */}
+          {activeProjectId && !!symbologyLayers.length && (
+            <Card className="absolute bottom-4 right-4 z-20 w-64 overflow-hidden !rounded-lg shadow-[var(--shadow-card-hover)]">
+              <div className="flex items-center justify-between gap-1.5 border-b border-slate-100 bg-slate-50 px-3 py-1.5">
+                <span className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                  <Layers size={12} />
+                  Legend
+                </span>
+                <span className="text-[11px] font-semibold text-slate-400">{featureCount} total</span>
               </div>
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 px-3.5 py-2.5 text-xs font-medium text-slate-600">
-                {projectSymbologies.map((s) => (
-                  <span key={s.id} className="flex items-center gap-1.5">
-                    <span className="h-2.5 w-2.5 rounded-full ring-2 ring-white" style={{ backgroundColor: s.color, boxShadow: '0 0 0 1px rgba(30,36,49,0.12)' }} />
-                    <span>{s.name}</span>
-                  </span>
-                ))}
+              <div className="max-h-72 overflow-y-auto px-3 py-2.5">
+                {legendGroups.map(({ label, type }) => {
+                  const items = symbologyLayers.filter((s) => s.geometryType === type)
+                  if (!items.length) return null
+                  return (
+                    <div key={type} className="mb-2.5 last:mb-0">
+                      <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">{label}</p>
+                      <div className="space-y-1">
+                        {items.map((s) => (
+                          <div key={s.id} className="flex items-center gap-2 text-xs font-medium text-slate-600">
+                            {type === 'LineString' ? (
+                              <span className="h-1 w-3.5 shrink-0 rounded-full" style={{ backgroundColor: s.color }} />
+                            ) : type === 'Polygon' ? (
+                              <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ backgroundColor: s.color, opacity: 0.5, boxShadow: `inset 0 0 0 1.5px ${s.color}` }} />
+                            ) : (
+                              <span className="h-2.5 w-2.5 shrink-0 rounded-full ring-2 ring-white" style={{ backgroundColor: s.color, boxShadow: '0 0 0 1px rgba(30,36,49,0.12)' }} />
+                            )}
+                            <span className="min-w-0 flex-1 truncate">{s.name}</span>
+                            <span className="tabular-nums text-slate-400">{s.count}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
             </Card>
           )}
@@ -611,10 +1000,33 @@ export function MapDashboardPage() {
             </div>
           )}
 
+          {(tool === 'measure-distance' || tool === 'measure-area') && (
+            <div className="absolute left-1/2 top-4 z-20 flex -translate-x-1/2 items-center gap-2 rounded-lg bg-amber-600/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">
+              {measurePoints.length === 0 ? (
+                <span>Click to start measuring {tool === 'measure-area' ? 'an area' : 'a distance'}</span>
+              ) : (
+                <span className="tabular-nums">
+                  {formatDistance(measureDistance)}
+                  {tool === 'measure-area' && measurePoints.length >= 3 && <> · {formatArea(measureArea)}</>}
+                  {tool === 'measure-area' && measurePoints.length < 3 && <> · add {3 - measurePoints.length} more point{3 - measurePoints.length === 1 ? '' : 's'} for area</>}
+                </span>
+              )}
+              <button onClick={undoMeasurePoint} disabled={!measurePoints.length} className="ml-1 rounded p-1 hover:bg-white/20 disabled:opacity-40">
+                <Undo2 size={14} />
+              </button>
+              <button onClick={() => setMeasurePoints([])} disabled={!measurePoints.length} className="rounded p-1 hover:bg-white/20 disabled:opacity-40" title="Clear">
+                <Trash2 size={14} />
+              </button>
+              <button onClick={resetDrawing} className="rounded p-1 hover:bg-white/20" title="Exit measure mode">
+                <X size={14} />
+              </button>
+            </div>
+          )}
+
           {/* New-asset submission panel */}
           {showForm && (
             <div className="absolute right-4 top-4 z-20 w-80">
-              <Card className="overflow-hidden shadow-xl">
+              <Card className="overflow-hidden !rounded-lg shadow-xl">
                 <PanelHeader icon={<MapPin size={14} />} title={`New ${draftGeometry && GEOMETRY_LABEL[draftGeometry.type]} Asset`} right={<Badge tone="neutral">{draftGeometry?.type}</Badge>} />
                 <div className="p-4">
                   <Select
@@ -643,7 +1055,7 @@ export function MapDashboardPage() {
           {/* Review panel for an existing asset — approve/reject right from the map. */}
           {selectedFeature && (
             <div className="absolute right-4 top-4 z-20 w-80">
-              <Card className="overflow-hidden shadow-xl">
+              <Card className="overflow-hidden !rounded-lg shadow-xl">
                 <PanelHeader
                   icon={<span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: selectedFeature.properties.symbology?.color ?? FALLBACK_COLOR }} />}
                   title={selectedFeature.properties.symbology?.name ?? selectedFeature.properties.assetType.replace(/_/g, ' ')}
@@ -664,19 +1076,46 @@ export function MapDashboardPage() {
                       ))}
                     </div>
                   )}
-                  {selectedFeature.properties.status === 'pending' && canApprove && (
+                  {selectedFeature.properties.status === 'rejected' && selectedFeature.properties.rejectionReason && (
+                    <div className="mb-3 rounded-lg border border-danger-200 bg-danger-50 p-2.5 text-xs text-danger-700">
+                      <span className="font-semibold">Reason: </span>
+                      {selectedFeature.properties.rejectionReason}
+                    </div>
+                  )}
+                  {/* Status can always be changed, regardless of its current
+                      state — approve something previously rejected, or pull
+                      back an approval that turned out to be wrong. */}
+                  {canApprove && (
                     <div className="mb-2 flex gap-2">
-                      <Button variant="outline" leftIcon={<ThumbsDown size={14} />} onClick={() => reject.mutate(selectedFeature.id)} loading={reject.isPending} className="flex-1">
+                      <Button
+                        variant="outline"
+                        leftIcon={<ThumbsDown size={14} />}
+                        onClick={() => reject.mutate(selectedFeature.id)}
+                        loading={reject.isPending}
+                        disabled={selectedFeature.properties.status === 'rejected'}
+                        className="flex-1"
+                      >
                         Reject
                       </Button>
-                      <Button leftIcon={<ThumbsUp size={14} />} onClick={() => approve.mutate(selectedFeature.id)} loading={approve.isPending} className="flex-1">
+                      <Button
+                        leftIcon={<ThumbsUp size={14} />}
+                        onClick={() => approve.mutate(selectedFeature.id)}
+                        loading={approve.isPending}
+                        disabled={selectedFeature.properties.status === 'approved'}
+                        className="flex-1"
+                      >
                         Approve
                       </Button>
                     </div>
                   )}
                   {canEditGeometry && (
-                    <Button variant="outline" leftIcon={<PenLine size={14} />} onClick={() => startEditGeometry(selectedFeature)} className="w-full">
+                    <Button variant="outline" leftIcon={<PenLine size={14} />} onClick={() => startEditGeometry(selectedFeature)} className="mb-2 w-full">
                       Edit Geometry
+                    </Button>
+                  )}
+                  {canDelete && (
+                    <Button variant="danger" leftIcon={<Trash2 size={14} />} onClick={() => setConfirmDeleteId(selectedFeature.id)} className="w-full">
+                      Remove from Map
                     </Button>
                   )}
                 </div>
@@ -687,7 +1126,7 @@ export function MapDashboardPage() {
           {/* Geometry-editing panel — drag vertices, add/remove points, save or cancel. */}
           {editingFeature && (
             <div className="absolute right-4 top-4 z-20 w-80">
-              <Card className="overflow-hidden shadow-xl">
+              <Card className="overflow-hidden !rounded-lg shadow-xl">
                 <PanelHeader
                   icon={<PenLine size={14} />}
                   title={`Editing ${editingFeature.properties.symbology?.name ?? editingFeature.properties.assetType.replace(/_/g, ' ')}`}
@@ -713,7 +1152,7 @@ export function MapDashboardPage() {
           )}
         </div>
 
-        <div className="flex h-7 shrink-0 items-center gap-4 border-t border-slate-100 bg-slate-50 px-3.5 text-[11px] font-medium text-slate-500">
+        <div className="flex h-6 shrink-0 items-center gap-4 border-t border-black/30 bg-primary-950 px-3.5 text-[11px] font-medium text-slate-400">
           <span className="flex items-center gap-1">
             <FolderKanban size={11} />
             {activeProject?.name ?? 'No project selected'}
@@ -723,22 +1162,42 @@ export function MapDashboardPage() {
             {featureCount} asset{featureCount === 1 ? '' : 's'}
           </span>
           <div className="flex-1" />
-          <span className="flex items-center gap-1 tabular-nums">
+          <span className="flex items-center gap-1 font-mono tabular-nums text-slate-300">
             <Crosshair size={11} />
             {cursorLngLat ? `${cursorLngLat.lat.toFixed(5)}, ${cursorLngLat.lng.toFixed(5)}` : '—'}
           </span>
-          <span className="tabular-nums">Zoom {zoom.toFixed(1)}</span>
+          <span className="font-mono tabular-nums text-slate-300">Zoom {zoom.toFixed(1)}</span>
         </div>
       </div>
 
       <ImportModal open={importOpen} onClose={() => setImportOpen(false)} projects={projectsQuery.data?.items ?? []} onDone={invalidateAssets} pushToast={push} />
       <ExportModal open={exportOpen} onClose={() => setExportOpen(false)} projects={projectsQuery.data?.items ?? []} pushToast={push} />
+      <ConfirmDialog
+        open={!!confirmDeleteId}
+        title="Remove this asset?"
+        message="This removes it from the map entirely — not the same as rejecting it. This can't be undone from here."
+        confirmLabel="Remove"
+        danger
+        loading={removeAsset.isPending}
+        onConfirm={() => confirmDeleteId && removeAsset.mutate(confirmDeleteId)}
+        onClose={() => setConfirmDeleteId(null)}
+      />
     </div>
   )
 }
 
 function titleize(key: string): string {
   return key.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase())
+}
+
+function initials(name?: string): string {
+  if (!name) return 'U'
+  return name
+    .split(' ')
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((s) => s[0]?.toUpperCase())
+    .join('')
 }
 
 function ToolbarButton({ icon, label, active, disabled, onClick }: { icon: ReactNode; label: string; active?: boolean; disabled?: boolean; onClick: () => void }) {
@@ -748,12 +1207,11 @@ function ToolbarButton({ icon, label, active, disabled, onClick }: { icon: React
       onClick={onClick}
       disabled={disabled}
       title={label}
-      className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-        active ? 'bg-primary-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-100 hover:text-ink'
+      className={`grid h-7 w-7 shrink-0 place-items-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-30 ${
+        active ? 'bg-primary-600 text-white shadow-sm' : 'text-slate-300 hover:bg-white/10 hover:text-white'
       }`}
     >
       {icon}
-      <span>{label}</span>
     </button>
   )
 }
