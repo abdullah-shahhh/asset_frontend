@@ -1186,6 +1186,17 @@ export function MapDashboardPage() {
             >
               {cellTowersLoading ? <Spinner className="h-3.5 w-3.5 border-white/30 border-t-white" /> : <Radio size={15} />}
             </button>
+
+            {showCellTowers && (
+              <div className="flex flex-col gap-1 rounded-lg border border-white/10 bg-primary-950/95 px-2.5 py-2 shadow-[var(--shadow-card-hover)] backdrop-blur">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Cell Density</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[9px] font-medium text-slate-400">Low</span>
+                  <div className="h-2 w-20 rounded-full" style={{ background: 'linear-gradient(to right, rgba(56,189,248,0.35), rgba(56,189,248,.9), rgba(250,204,21,.9), rgba(249,115,22,.95), rgba(220,38,38,1))' }} />
+                  <span className="text-[9px] font-medium text-slate-400">High</span>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Symbology legend for the active project — grouped by kind, with a
