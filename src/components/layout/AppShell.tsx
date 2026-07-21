@@ -13,10 +13,10 @@ const NAV = [
   { to: ROUTES.submissions, label: 'Submissions', icon: ClipboardCheck, permission: null },
   { to: ROUTES.projects, label: 'Projects', icon: FolderKanban, permission: null },
   { to: ROUTES.fieldTeam, label: 'Field Team', icon: HardHat, permission: 'field_team.view' },
-  { to: ROUTES.team, label: 'Team', icon: Users, permission: 'users.view' },
 ]
 
 const SETTINGS_NAV = [
+  { to: ROUTES.team, label: 'Users', icon: Users, permission: 'users.view' },
   { to: ROUTES.roles, label: 'Roles', icon: ShieldCheck, permission: 'roles.view' },
   { to: ROUTES.symbologies, label: 'Symbology', icon: Paintbrush, permission: 'symbologies.view' },
   { to: ROUTES.branding, label: 'Branding', icon: Palette, permission: 'branding.manage' },

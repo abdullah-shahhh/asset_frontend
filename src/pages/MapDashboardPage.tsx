@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import maplibregl, { Map as MapLibreMap } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
+import * as shpwrite from '@mapbox/shp-write'
 import {
   MapPin,
   Spline,
@@ -31,19 +32,23 @@ import {
   Zap,
   Wrench,
   Radio,
+  Camera,
+  Image as ImageIcon,
 } from 'lucide-react'
 import {
   networkAssetsApi,
   projectsApi,
   exportApi,
   downloadGeoJSON,
+  mediaApi,
   ApiError,
+  type AssetTypeField,
   type GeoJsonGeometry,
   type GeometryType,
   type NetworkAssetFeature,
 } from '../lib/api'
 import { TILES_BASE, mapifyitTransformRequest } from '../lib/maps'
-import { Badge, Button, Card, Checkbox, ConfirmDialog, Dropdown, Modal, Select, Spinner, Textarea, useToast } from '../components/ui'
+import { Badge, Button, Card, Checkbox, ConfirmDialog, Dropdown, Input, Modal, Select, Spinner, Textarea, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
 import { resolveSymbologyIcon } from '../lib/symbologyIcons'
 import { mediaUrl } from '../theme/branding'
@@ -237,6 +242,8 @@ export function MapDashboardPage() {
   // Submission form state.
   const [symbologyId, setSymbologyId] = useState('')
   const [notes, setNotes] = useState('')
+  const [templateValues, setTemplateValues] = useState<Record<string, string | number | boolean>>({})
+  const [photos, setPhotos] = useState<File[]>([])
 
   // Selected existing feature (review panel).
   const [selectedFeature, setSelectedFeature] = useState<NetworkAssetFeature | null>(null)
@@ -307,9 +314,12 @@ export function MapDashboardPage() {
   const invalidateAssets = () => queryClient.invalidateQueries({ queryKey: ['network-assets'] })
 
   const createAsset = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!draftGeometry || !symbologyId || !activeProjectId) throw new Error('Missing fields')
-      return networkAssetsApi.create({ projectId: activeProjectId, symbologyId, geometry: draftGeometry, attributes: notes ? { notes } : {} })
+      const attributes = activeProject?.templateFields.length ? templateValues : notes ? { notes } : {}
+      const created = await networkAssetsApi.create({ projectId: activeProjectId, symbologyId, geometry: draftGeometry, attributes })
+      if (photos.length) await Promise.all(photos.map((file) => mediaApi.upload(created.id, file)))
+      return created
     },
     onSuccess: () => {
       push('Asset submitted for review', 'success')
@@ -432,6 +442,8 @@ export function MapDashboardPage() {
     setDraftGeometry(null)
     setSymbologyId('')
     setNotes('')
+    setTemplateValues({})
+    setPhotos([])
     setMeasurePoints([])
   }
 
@@ -1036,6 +1048,10 @@ export function MapDashboardPage() {
   }, [measurePoints, tool, basemapStyle])
 
   const showForm = Boolean(draftGeometry)
+  const templateFields = activeProject?.templateFields ?? []
+  const missingRequiredField = templateFields.some((f) => f.required && !templateValues[f.key])
+  const needsPhoto = !!activeProject?.photosRequired && photos.length === 0
+  const submitDisabled = !symbologyId || missingRequiredField || needsPhoto
   const canFinishShape = (tool === 'line' && linePoints.length >= 2) || (tool === 'polygon' && linePoints.length >= 3)
   const measureDistance = tool === 'measure-distance' || tool === 'measure-area' ? pathDistanceMeters(tool === 'measure-area' && measurePoints.length >= 3 ? [...measurePoints, measurePoints[0]] : measurePoints) : 0
   const measureArea = tool === 'measure-area' && measurePoints.length >= 3 ? ringAreaSqMeters(measurePoints) : 0
@@ -1309,13 +1325,52 @@ export function MapDashboardPage() {
                     options={eligibleSymbologies.map((s) => ({ value: s.id, label: s.name }))}
                     containerClassName="mb-3"
                   />
-                  <Textarea label="Notes (optional)" value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} containerClassName="mb-3" />
+
+                  {templateFields.length > 0 ? (
+                    templateFields.map((f) => (
+                      <TemplateFieldInput
+                        key={f.key}
+                        field={f}
+                        value={templateValues[f.key]}
+                        onChange={(v) => setTemplateValues((prev) => ({ ...prev, [f.key]: v }))}
+                      />
+                    ))
+                  ) : (
+                    <Textarea label="Notes (optional)" value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} containerClassName="mb-3" />
+                  )}
+
+                  <div className="mb-3">
+                    <label className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold text-slate-700">
+                      <Camera size={14} />
+                      Photos {activeProject?.photosRequired && <span className="text-danger-500">*</span>}
+                    </label>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={(e) => setPhotos((prev) => [...prev, ...Array.from(e.target.files ?? [])])}
+                      className="block w-full text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-primary-50 file:px-3 file:py-2 file:text-sm file:font-semibold file:text-primary-700 hover:file:bg-primary-100"
+                    />
+                    {photos.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {photos.map((f, i) => (
+                          <span key={`${f.name}-${i}`} className="flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">
+                            {f.name}
+                            <button type="button" onClick={() => setPhotos((prev) => prev.filter((_, idx) => idx !== i))} className="text-slate-400 hover:text-slate-700">
+                              <X size={11} />
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {needsPhoto && <p className="mt-1 text-xs font-medium text-danger-600">At least one photo is required for this project.</p>}
+                  </div>
 
                   <div className="flex gap-2">
                     <Button variant="outline" onClick={resetDrawing} className="flex-1">
                       Cancel
                     </Button>
-                    <Button onClick={() => createAsset.mutate()} loading={createAsset.isPending} disabled={!symbologyId} className="flex-1">
+                    <Button onClick={() => createAsset.mutate()} loading={createAsset.isPending} disabled={submitDisabled} className="flex-1">
                       Submit
                     </Button>
                   </div>
@@ -1380,6 +1435,21 @@ export function MapDashboardPage() {
                     <div className="mb-3 rounded-lg border border-danger-200 bg-danger-50 p-2.5 text-xs text-danger-700">
                       <span className="font-semibold">Reason: </span>
                       {selectedFeature.properties.rejectionReason}
+                    </div>
+                  )}
+                  {selectedFeature.properties.media.length > 0 && (
+                    <div className="mb-3">
+                      <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                        <ImageIcon size={12} />
+                        Photos ({selectedFeature.properties.media.length})
+                      </div>
+                      <div className="grid grid-cols-4 gap-1.5">
+                        {selectedFeature.properties.media.map((m) => (
+                          <a key={m.id} href={mediaUrl(m.url) ?? undefined} target="_blank" rel="noreferrer" className="block aspect-square overflow-hidden rounded-md bg-slate-100 ring-1 ring-slate-200">
+                            <img src={mediaUrl(m.url) ?? ''} alt="" className="h-full w-full object-cover" />
+                          </a>
+                        ))}
+                      </div>
                     </div>
                   )}
                   {/* Status can always be changed, regardless of its current
@@ -1528,6 +1598,44 @@ function LegendPointSwatch({ color, icon, iconUrl }: { color: string; icon: stri
   )
 }
 
+/** One typed input for a project's survey template field — the field's
+ * `type` picks which control renders, mirroring how AssetTypeField is
+ * defined and validated on the backend. */
+function TemplateFieldInput({ field, value, onChange }: { field: AssetTypeField; value: string | number | boolean | undefined; onChange: (v: string | number | boolean) => void }) {
+  const label = field.label + (field.required ? ' *' : '')
+  if (field.type === 'select') {
+    return (
+      <Select
+        label={label}
+        value={typeof value === 'string' ? value : ''}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Select…"
+        options={(field.options ?? []).map((o) => ({ value: o, label: o }))}
+        containerClassName="mb-3"
+      />
+    )
+  }
+  if (field.type === 'boolean') {
+    return (
+      <div className="mb-3">
+        <Checkbox label={label} checked={Boolean(value)} onChange={(e) => onChange(e.target.checked)} />
+      </div>
+    )
+  }
+  if (field.type === 'textarea') {
+    return <Textarea label={label} value={typeof value === 'string' ? value : ''} onChange={(e) => onChange(e.target.value)} rows={2} containerClassName="mb-3" />
+  }
+  return (
+    <Input
+      label={label}
+      type={field.type === 'number' ? 'number' : field.type === 'date' ? 'date' : 'text'}
+      value={value == null ? '' : String(value)}
+      onChange={(e) => onChange(field.type === 'number' ? e.target.valueAsNumber : e.target.value)}
+      containerClassName="mb-3"
+    />
+  )
+}
+
 function PanelHeader({ icon, title, subtitle, right, onClose }: { icon: ReactNode; title: string; subtitle?: string; right?: ReactNode; onClose?: () => void }) {
   return (
     <div className="flex items-center justify-between gap-2 border-b border-slate-100 bg-slate-50 px-4 py-2.5">
@@ -1608,14 +1716,38 @@ function ImportModal({
   )
 }
 
+const EXPORT_FORMAT_OPTIONS = [
+  { value: 'geojson', label: 'GeoJSON (.geojson)' },
+  { value: 'shapefile', label: 'Shapefile (.zip)' },
+]
+
 function ExportModal({ open, onClose, projects, pushToast }: { open: boolean; onClose: () => void; projects: { id: string; name: string }[]; pushToast: (m: string, t?: 'success' | 'error' | 'info') => void }) {
   const [projectId, setProjectId] = useState('')
+  const [format, setFormat] = useState<'geojson' | 'shapefile'>('geojson')
 
   const exportMutation = useMutation({
     mutationFn: () => exportApi.projectGeoJSON(projectId),
     onSuccess: (data) => {
       const project = projects.find((p) => p.id === projectId)
-      downloadGeoJSON(data, `${project?.name ?? 'export'}-approved-assets`)
+      const filename = `${project?.name ?? 'export'}-approved-assets`
+      if (format === 'shapefile') {
+        if (data.features.length === 0) {
+          pushToast('No approved assets to export', 'info')
+          return
+        }
+        shpwrite.download(data as unknown as GeoJSON.FeatureCollection, {
+          outputType: 'blob',
+          compression: 'DEFLATE',
+          folder: filename,
+          filename,
+          // @mapbox/shp-write keys its `types` option by the layer's internal shapefile
+          // type name lowercased (POLYLINE -> "polyline"), not by the GeoJSON geometry
+          // name — its shipped .d.ts labels this key "line", which doesn't match at runtime.
+          types: { point: 'points', polyline: 'lines', polygon: 'polygons' } as unknown as NonNullable<Parameters<typeof shpwrite.download>[1]>['types'],
+        })
+      } else {
+        downloadGeoJSON(data, filename)
+      }
       pushToast('Export downloaded', 'success')
       onClose()
     },
@@ -1627,7 +1759,7 @@ function ExportModal({ open, onClose, projects, pushToast }: { open: boolean; on
       open={open}
       onClose={onClose}
       title="Export Approved Assets"
-      subtitle="Downloads a GeoJSON file of every approved asset in the selected project."
+      subtitle="Downloads every approved asset in the selected project, in the format chosen below."
       footer={
         <>
           <Button variant="outline" onClick={onClose}>
@@ -1639,7 +1771,18 @@ function ExportModal({ open, onClose, projects, pushToast }: { open: boolean; on
         </>
       }
     >
-      <Select label="Project" value={projectId} onChange={(e) => setProjectId(e.target.value)} placeholder="Select project" options={projects.map((p) => ({ value: p.id, label: p.name }))} />
+      <div className="space-y-4">
+        <Select label="Project" value={projectId} onChange={(e) => setProjectId(e.target.value)} placeholder="Select project" options={projects.map((p) => ({ value: p.id, label: p.name }))} />
+        <Select
+          label="Format"
+          value={format}
+          onChange={(e) => setFormat(e.target.value as 'geojson' | 'shapefile')}
+          options={EXPORT_FORMAT_OPTIONS}
+        />
+        {format === 'shapefile' && (
+          <p className="text-xs text-slate-500">Points, lines, and polygons are written as separate layers inside the .zip, matching the ArcGIS/QGIS shapefile convention.</p>
+        )}
+      </div>
     </Modal>
   )
 }

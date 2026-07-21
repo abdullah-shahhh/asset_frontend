@@ -61,7 +61,7 @@ export function TeamPage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader
-        title="Team"
+        title="Users"
         subtitle="Admins and managers who can log into the client panel — review submissions, manage projects, and configure your organization."
         action={
           canManage && (

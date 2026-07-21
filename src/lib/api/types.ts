@@ -21,11 +21,17 @@ export interface OrgUser {
   createdAt: string
 }
 
+/** Freeform label — organizations name their own survey types, it isn't a fixed set. */
+export type ProjectSurveyType = string
+
 export interface Project {
   id: string
   name: string
   description: string | null
   status: 'active' | 'completed' | 'archived'
+  surveyType: ProjectSurveyType
+  templateFields: AssetTypeField[]
+  photosRequired: boolean
   createdAt: string
   updatedAt: string
 }
@@ -100,6 +106,7 @@ export interface NetworkAssetProperties {
   reviewedByUserId: string | null
   reviewedAt: string | null
   rejectionReason: string | null
+  media: { id: string; url: string; mimeType: string | null; sizeBytes: number | null; createdAt: string }[]
   createdAt: string
   updatedAt: string
 }

@@ -2,11 +2,12 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import { ClipboardCheck, Eye, FolderKanban, ThumbsDown, ThumbsUp, Trash2, User } from 'lucide-react'
+import { ClipboardCheck, Eye, FolderKanban, Image as ImageIcon, ThumbsDown, ThumbsUp, Trash2, User } from 'lucide-react'
 import { networkAssetsApi, ApiError, type AssetStatus, type GeoJsonGeometry, type NetworkAssetFeature } from '../lib/api'
 import { TILES_BASE, mapifyitTransformRequest } from '../lib/maps'
 import { Button, Card, ConfirmDialog, DataState, EmptyState, Modal, PageHeader, Select, StatusBadge, Table, TBody, TD, Textarea, TH, THead, TR, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
+import { mediaUrl } from '../theme/branding'
 
 const FALLBACK_COLOR = '#64748b'
 
@@ -178,6 +179,22 @@ function ReviewModal({
           <div className="rounded-xl border border-danger-200 bg-danger-50 p-3 text-sm text-danger-700">
             <span className="font-semibold">Sent back for edit: </span>
             {p.rejectionReason}
+          </div>
+        )}
+
+        {p.media.length > 0 && (
+          <div>
+            <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+              <ImageIcon size={12} />
+              Photos ({p.media.length})
+            </div>
+            <div className="grid grid-cols-5 gap-1.5">
+              {p.media.map((m) => (
+                <a key={m.id} href={mediaUrl(m.url) ?? undefined} target="_blank" rel="noreferrer" className="block aspect-square overflow-hidden rounded-md bg-slate-100 ring-1 ring-slate-200">
+                  <img src={mediaUrl(m.url) ?? ''} alt="" className="h-full w-full object-cover" />
+                </a>
+              ))}
+            </div>
           </div>
         )}
 

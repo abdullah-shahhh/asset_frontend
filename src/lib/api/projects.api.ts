@@ -1,5 +1,6 @@
 import { api } from './client'
-import type { Project, Symbology } from './types'
+import type { AssetTypeField, Project, ProjectSurveyType, Symbology } from './types'
+import type { Surveyor } from './fieldTeam.api'
 
 export interface ProjectListParams {
   page?: number
@@ -11,6 +12,9 @@ export interface ProjectPayload {
   name: string
   description?: string
   status?: 'active' | 'completed' | 'archived'
+  surveyType?: ProjectSurveyType
+  templateFields?: AssetTypeField[]
+  photosRequired?: boolean
 }
 
 export const projectsApi = {
@@ -21,4 +25,6 @@ export const projectsApi = {
   remove: (id: string) => api.del<null>(`/v1/org/projects/${id}`),
   getSymbologies: (id: string) => api.get<Symbology[]>(`/v1/org/projects/${id}/symbologies`),
   setSymbologies: (id: string, symbologyIds: string[]) => api.put<Symbology[]>(`/v1/org/projects/${id}/symbologies`, { symbologyIds }),
+  getSurveyors: (id: string) => api.get<Surveyor[]>(`/v1/org/projects/${id}/surveyors`),
+  setSurveyors: (id: string, surveyorIds: string[]) => api.put<Surveyor[]>(`/v1/org/projects/${id}/surveyors`, { surveyorIds }),
 }

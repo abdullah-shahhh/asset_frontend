@@ -1,24 +1,30 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { FolderKanban, MapPin, Palette, Plus, Spline, Square } from 'lucide-react'
-import { projectsApi, symbologiesApi, ApiError, type GeometryType, type Project, type Symbology } from '../lib/api'
+import { FolderKanban, MapPin, Palette, Plus, Spline, Square, Users } from 'lucide-react'
+import { fieldTeamApi, projectsApi, symbologiesApi, ApiError, type GeometryType, type Project, type Surveyor, type Symbology } from '../lib/api'
 import { Badge, Button, Card, Checkbox, DataState, EmptyState, Input, Modal, PageHeader, Table, TBody, TD, TH, THead, TR, Textarea, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
 
 const GEOMETRY_ICON: Record<GeometryType, typeof MapPin> = { Point: MapPin, LineString: Spline, Polygon: Square }
 
+const SURVEY_TYPE_SUGGESTIONS = ['Custom', 'OFC Survey', 'Road Survey']
+
 export function ProjectsPage() {
   const [modalOpen, setModalOpen] = useState(false)
   const [assigningProject, setAssigningProject] = useState<Project | null>(null)
+  const [assigningSurveyors, setAssigningSurveyors] = useState<Project | null>(null)
   const { hasPermission } = useAuth()
   const canCreate = hasPermission('projects.create')
   const canManageSymbologies = hasPermission('symbologies.manage')
+  const canManageSurveyors = hasPermission('projects.update')
   const queryClient = useQueryClient()
   const { push } = useToast()
 
   const query = useQuery({ queryKey: ['projects'], queryFn: () => projectsApi.list({ limit: 50 }) })
 
   const projects = query.data?.items ?? []
+  const showActions = canManageSymbologies || canManageSurveyors
+  const existingSurveyTypes = Array.from(new Set(projects.map((p) => p.surveyType).filter(Boolean)))
 
   return (
     <div className="flex flex-col gap-5">
@@ -53,9 +59,10 @@ export function ProjectsPage() {
             <THead>
               <TR>
                 <TH>Name</TH>
+                <TH>Type</TH>
                 <TH>Status</TH>
                 <TH>Created</TH>
-                {canManageSymbologies && <TH className="text-right">Actions</TH>}
+                {showActions && <TH className="text-right">Actions</TH>}
               </TR>
             </THead>
             <TBody>
@@ -66,14 +73,29 @@ export function ProjectsPage() {
                     {p.description && <div className="text-xs text-muted">{p.description}</div>}
                   </TD>
                   <TD>
+                    <Badge tone="neutral">{p.surveyType || 'Custom'}</Badge>
+                    {p.photosRequired && (
+                      <span className="ml-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted">Photos required</span>
+                    )}
+                  </TD>
+                  <TD>
                     <Badge tone={p.status === 'active' ? 'success' : 'neutral'}>{p.status}</Badge>
                   </TD>
                   <TD className="text-muted">{new Date(p.createdAt).toLocaleDateString()}</TD>
-                  {canManageSymbologies && (
+                  {showActions && (
                     <TD className="text-right">
-                      <Button size="sm" variant="outline" leftIcon={<Palette size={14} />} onClick={() => setAssigningProject(p)}>
-                        Symbologies
-                      </Button>
+                      <div className="flex justify-end gap-2">
+                        {canManageSurveyors && (
+                          <Button size="sm" variant="outline" leftIcon={<Users size={14} />} onClick={() => setAssigningSurveyors(p)}>
+                            Surveyors
+                          </Button>
+                        )}
+                        {canManageSymbologies && (
+                          <Button size="sm" variant="outline" leftIcon={<Palette size={14} />} onClick={() => setAssigningProject(p)}>
+                            Symbologies
+                          </Button>
+                        )}
+                      </div>
                     </TD>
                   )}
                 </TR>
@@ -83,27 +105,77 @@ export function ProjectsPage() {
         </DataState>
       </Card>
 
-      <CreateProjectModal open={modalOpen} onClose={() => setModalOpen(false)} onDone={() => { setModalOpen(false); queryClient.invalidateQueries({ queryKey: ['projects'] }) }} pushToast={push} />
+      <CreateProjectModal
+        open={modalOpen}
+        onClose={() => setModalOpen(false)}
+        onDone={() => { setModalOpen(false); queryClient.invalidateQueries({ queryKey: ['projects'] }) }}
+        pushToast={push}
+        existingSurveyTypes={existingSurveyTypes}
+      />
 
       <AssignSymbologiesModal project={assigningProject} onClose={() => setAssigningProject(null)} pushToast={push} />
+      <AssignSurveyorsModal project={assigningSurveyors} onClose={() => setAssigningSurveyors(null)} pushToast={push} />
     </div>
   )
 }
 
-function CreateProjectModal({ open, onClose, onDone, pushToast }: { open: boolean; onClose: () => void; onDone: () => void; pushToast: (m: string, t?: 'success' | 'error' | 'info') => void }) {
+function CreateProjectModal({
+  open,
+  onClose,
+  onDone,
+  pushToast,
+  existingSurveyTypes,
+}: {
+  open: boolean
+  onClose: () => void
+  onDone: () => void
+  pushToast: (m: string, t?: 'success' | 'error' | 'info') => void
+  existingSurveyTypes: string[]
+}) {
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
+  const [surveyType, setSurveyType] = useState('')
+  const [selectedSurveyorIds, setSelectedSurveyorIds] = useState<Set<string>>(new Set())
+
+  const surveyorsQuery = useQuery({ queryKey: ['field-team', 'active'], queryFn: () => fieldTeamApi.list({ status: 'active', limit: 100 }), enabled: open })
+  const surveyors: Surveyor[] = surveyorsQuery.data?.items ?? []
+  const allSelected = surveyors.length > 0 && selectedSurveyorIds.size === surveyors.length
+
+  function toggleSurveyor(id: string) {
+    setSelectedSurveyorIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  function toggleAll() {
+    setSelectedSurveyorIds(allSelected ? new Set() : new Set(surveyors.map((s) => s.id)))
+  }
+
+  function reset() {
+    setName('')
+    setDescription('')
+    setSurveyType('')
+    setSelectedSurveyorIds(new Set())
+  }
 
   const create = useMutation({
-    mutationFn: () => projectsApi.create({ name, description: description || undefined }),
+    mutationFn: async () => {
+      const project = await projectsApi.create({ name, description: description || undefined, surveyType: surveyType.trim() || undefined })
+      if (selectedSurveyorIds.size > 0) await projectsApi.setSurveyors(project.id, Array.from(selectedSurveyorIds))
+      return project
+    },
     onSuccess: () => {
       pushToast('Project created', 'success')
-      setName('')
-      setDescription('')
+      reset()
       onDone()
     },
     onError: (err) => pushToast(err instanceof ApiError ? err.message : 'Failed to create project', 'error'),
   })
+
+  const typeOptions = Array.from(new Set([...SURVEY_TYPE_SUGGESTIONS, ...existingSurveyTypes]))
 
   return (
     <Modal
@@ -120,6 +192,44 @@ function CreateProjectModal({ open, onClose, onDone, pushToast }: { open: boolea
       <div className="flex flex-col gap-3">
         <Input label="Name" value={name} onChange={(e) => setName(e.target.value)} required />
         <Textarea label="Description" value={description} onChange={(e) => setDescription(e.target.value)} rows={3} />
+        <Input
+          label="Type"
+          list="survey-type-options"
+          value={surveyType}
+          onChange={(e) => setSurveyType(e.target.value)}
+          placeholder="e.g. OFC Survey"
+          hint="Pick an existing type or type a new one."
+        />
+        <datalist id="survey-type-options">
+          {typeOptions.map((t) => (
+            <option key={t} value={t} />
+          ))}
+        </datalist>
+
+        <div>
+          <div className="mb-1.5 flex items-center justify-between">
+            <label className="text-sm font-semibold text-slate-700">Surveyors</label>
+            {surveyors.length > 0 && (
+              <button type="button" onClick={toggleAll} className="text-xs font-semibold text-primary-600 hover:text-primary-700">
+                {allSelected ? 'Clear all' : 'Select all'}
+              </button>
+            )}
+          </div>
+          {!surveyors.length ? (
+            <p className="text-sm text-muted">No active field surveyors yet — add some under Field Team first.</p>
+          ) : (
+            <div className="flex max-h-48 flex-col gap-1.5 overflow-y-auto rounded-lg border border-slate-100 p-3">
+              {surveyors.map((s) => (
+                <Checkbox
+                  key={s.id}
+                  checked={selectedSurveyorIds.has(s.id)}
+                  onChange={() => toggleSurveyor(s.id)}
+                  label={`${s.firstName} ${s.lastName ?? ''}`.trim() + ` — ${s.email}`}
+                />
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </Modal>
   )
@@ -209,6 +319,70 @@ function AssignSymbologiesModal({ project, onClose, pushToast }: { project: Proj
               </div>
             )
           })}
+        </div>
+      )}
+    </Modal>
+  )
+}
+
+function AssignSurveyorsModal({ project, onClose, pushToast }: { project: Project | null; onClose: () => void; pushToast: (m: string, t?: 'success' | 'error' | 'info') => void }) {
+  const queryClient = useQueryClient()
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [loadedForProjectId, setLoadedForProjectId] = useState<string | null>(null)
+
+  const allQuery = useQuery({ queryKey: ['field-team', 'active'], queryFn: () => fieldTeamApi.list({ status: 'active', limit: 100 }), enabled: !!project })
+  const assignedQuery = useQuery({
+    queryKey: ['projects', project?.id, 'surveyors'],
+    queryFn: () => projectsApi.getSurveyors(project!.id),
+    enabled: !!project,
+  })
+
+  if (project && project.id !== loadedForProjectId && assignedQuery.data) {
+    setLoadedForProjectId(project.id)
+    setSelected(new Set(assignedQuery.data.map((s) => s.id)))
+  }
+
+  function toggle(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const save = useMutation({
+    mutationFn: () => projectsApi.setSurveyors(project!.id, Array.from(selected)),
+    onSuccess: () => {
+      pushToast('Project surveyors updated', 'success')
+      queryClient.invalidateQueries({ queryKey: ['projects', project?.id, 'surveyors'] })
+      onClose()
+    },
+    onError: (err) => pushToast(err instanceof ApiError ? err.message : 'Failed to update surveyors', 'error'),
+  })
+
+  const surveyors: Surveyor[] = allQuery.data?.items ?? []
+
+  return (
+    <Modal
+      open={!!project}
+      onClose={onClose}
+      title={`Surveyors — ${project?.name ?? ''}`}
+      subtitle="Only checked surveyors may submit assets into this project. Org Admins can always submit to any project."
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>Cancel</Button>
+          <Button onClick={() => save.mutate()} loading={save.isPending}>Save</Button>
+        </>
+      }
+    >
+      {!surveyors.length ? (
+        <p className="text-sm text-muted">No active field surveyors yet — add some under Field Team first.</p>
+      ) : (
+        <div className="flex flex-col gap-1.5 rounded-lg border border-slate-100 p-3">
+          {surveyors.map((s) => (
+            <Checkbox key={s.id} checked={selected.has(s.id)} onChange={() => toggle(s.id)} label={`${s.firstName} ${s.lastName ?? ''}`.trim() + ` — ${s.email}`} />
+          ))}
         </div>
       )}
     </Modal>
