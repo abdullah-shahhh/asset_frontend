@@ -30,6 +30,7 @@ import {
   AlertTriangle,
   Zap,
   Wrench,
+  Radio,
 } from 'lucide-react'
 import {
   networkAssetsApi,
@@ -114,6 +115,26 @@ const GEOMETRY_LABEL: Record<GeometryType, string> = { Point: 'Point', LineStrin
 // network diagram — everything else (handholes, poles, ONTs...) is numerous
 // enough that always-on labels would just be clutter.
 const LABELED_SYMBOLOGY_NAMES = new Set(['Fiber Distribution Hub', 'Manhole'])
+
+// Live, public, no-key cellular tower dataset (FCC ASR data via HIFLD) —
+// real US cell tower locations, queried per-viewport for the heatmap layer.
+const CELL_TOWERS_URL = 'https://services2.arcgis.com/FiaPA4ga0iQKduv3/ArcGIS/rest/services/Cellular_Towers_in_the_United_States/FeatureServer/0/query'
+
+async function fetchCellTowers(bounds: maplibregl.LngLatBounds): Promise<GeoJSON.FeatureCollection> {
+  const params = new URLSearchParams({
+    geometry: JSON.stringify({ xmin: bounds.getWest(), ymin: bounds.getSouth(), xmax: bounds.getEast(), ymax: bounds.getNorth(), spatialReference: { wkid: 4326 } }),
+    geometryType: 'esriGeometryEnvelope',
+    inSR: '4326',
+    spatialRel: 'esriSpatialRelIntersects',
+    outFields: 'Licensee,StrucType',
+    returnGeometry: 'true',
+    f: 'geojson',
+    resultRecordCount: '2000',
+  })
+  const res = await fetch(`${CELL_TOWERS_URL}?${params.toString()}`)
+  if (!res.ok) throw new Error('Failed to load cell tower data')
+  return res.json()
+}
 
 // Demo fault simulator — picks a random reason from a realistic OFC fault pool.
 const FAULT_REASONS = [
@@ -236,6 +257,10 @@ export function MapDashboardPage() {
   const [basemapStyle, setBasemapStyle] = useState<BasemapStyle>('dark')
   const [layersOpen, setLayersOpen] = useState(false)
   const [hiddenSymbologyIds, setHiddenSymbologyIds] = useState<Set<string>>(new Set())
+
+  // Cell tower heatmap (real FCC/HIFLD data, fetched per-viewport).
+  const [showCellTowers, setShowCellTowers] = useState(false)
+  const [cellTowersLoading, setCellTowersLoading] = useState(false)
 
   // Status-bar telemetry.
   const [cursorLngLat, setCursorLngLat] = useState<{ lng: number; lat: number } | null>(null)
@@ -554,6 +579,103 @@ export function MapDashboardPage() {
     lastFitProjectRef.current = activeProjectId
     map.fitBounds(featureCollectionBounds(features), { padding: 80, maxZoom: 17, duration: 800 })
   }, [assetsQuery.data, activeProjectId])
+
+  // Cell tower heatmap — real, live FCC/HIFLD cell tower locations for
+  // whatever's in view, layered under everything else on the map.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    const ensureLayer = () => {
+      if (map.getSource('cell-towers')) return
+      map.addSource('cell-towers', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
+      // Insert beneath the org's own network layers (if already added) so the
+      // heatmap reads as background context, not a layer sitting on top.
+      const beforeId = map.getLayer('assets-polygons') ? 'assets-polygons' : undefined
+      map.addLayer(
+        {
+          id: 'cell-towers-heat',
+          type: 'heatmap',
+          source: 'cell-towers',
+          paint: {
+            'heatmap-weight': 1,
+            'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 0, 1, 12, 3],
+            'heatmap-color': [
+              'interpolate',
+              ['linear'],
+              ['heatmap-density'],
+              0,
+              'rgba(0,0,0,0)',
+              0.2,
+              'rgba(56,189,248,0.5)',
+              0.4,
+              'rgba(56,189,248,0.9)',
+              0.6,
+              'rgba(250,204,21,0.9)',
+              0.8,
+              'rgba(249,115,22,0.95)',
+              1,
+              'rgba(220,38,38,1)',
+            ],
+            'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 0, 8, 14, 34],
+            'heatmap-opacity': 0.7,
+          },
+        },
+        beforeId,
+      )
+      map.addLayer(
+        {
+          id: 'cell-towers-points',
+          type: 'circle',
+          source: 'cell-towers',
+          minzoom: 12,
+          paint: {
+            'circle-radius': 3,
+            'circle-color': '#fbbf24',
+            'circle-stroke-width': 1,
+            'circle-stroke-color': 'rgba(10,14,31,0.6)',
+            'circle-opacity': ['interpolate', ['linear'], ['zoom'], 12, 0, 13, 0.9],
+          },
+        },
+        beforeId,
+      )
+    }
+
+    const refresh = async () => {
+      if (!showCellTowers) return
+      setCellTowersLoading(true)
+      try {
+        const data = await fetchCellTowers(map.getBounds())
+        const source = map.getSource('cell-towers') as maplibregl.GeoJSONSource | undefined
+        source?.setData(data)
+      } catch {
+        // Best-effort demo layer — a transient failure just leaves the
+        // previous data in place, no need to surface an error toast.
+      } finally {
+        setCellTowersLoading(false)
+      }
+    }
+
+    if (showCellTowers) {
+      // Triggered long after initial load (a user toggle), not during the
+      // initial style bootstrap — isStyleLoaded() can spuriously report
+      // false for a while at low zoom while basemap tiles keep streaming in,
+      // and waiting on 'style.load' here would wait forever (it already
+      // fired once, at true startup). addSource/addLayer only need the
+      // style object to exist, which it does by now — call directly.
+      ensureLayer()
+      refresh()
+      map.on('moveend', refresh)
+    } else {
+      if (map.getLayer('cell-towers-heat')) map.removeLayer('cell-towers-heat')
+      if (map.getLayer('cell-towers-points')) map.removeLayer('cell-towers-points')
+      if (map.getSource('cell-towers')) map.removeSource('cell-towers')
+    }
+
+    return () => {
+      map.off('moveend', refresh)
+    }
+  }, [showCellTowers, basemapStyle])
 
   // Existing (submitted) assets layer — clicking one opens the review panel.
   // Re-runs on basemapStyle change too, since setStyle() wipes custom
@@ -1053,6 +1175,17 @@ export function MapDashboardPage() {
                 </Card>
               )}
             </div>
+
+            <button
+              type="button"
+              onClick={() => setShowCellTowers((v) => !v)}
+              title="Cell tower heatmap (live FCC/HIFLD data)"
+              className={`grid h-8 w-8 place-items-center rounded-lg border border-white/10 shadow-[var(--shadow-card-hover)] backdrop-blur transition-colors ${
+                showCellTowers ? 'bg-primary-600 text-white' : 'bg-primary-950/95 text-slate-300 hover:bg-white/10'
+              }`}
+            >
+              {cellTowersLoading ? <Spinner className="h-3.5 w-3.5 border-white/30 border-t-white" /> : <Radio size={15} />}
+            </button>
           </div>
 
           {/* Symbology legend for the active project — grouped by kind, with a
