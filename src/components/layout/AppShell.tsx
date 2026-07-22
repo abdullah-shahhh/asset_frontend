@@ -1,11 +1,14 @@
+import { useCallback } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
-import { Map, ClipboardCheck, FolderKanban, Users, HardHat, ShieldCheck, Palette, LogOut, Bell, LifeBuoy, Paintbrush, Settings, Radio, Contact, Ticket } from 'lucide-react'
+import { Map, ClipboardCheck, FolderKanban, Users, HardHat, ShieldCheck, Palette, LogOut, LifeBuoy, Paintbrush, Settings, Radio, Contact, Ticket, Sparkles } from 'lucide-react'
 import clsx from 'clsx'
 import { useAuth } from '../../auth/AuthContext'
 import { ROUTES } from '../../lib/routes'
 import { useApplyBranding } from '../../theme/useApplyBranding'
 import { mediaUrl } from '../../theme/branding'
-import { Dropdown } from '../ui'
+import { Dropdown, useToast, NotificationBell } from '../ui'
+import { useDemoMode } from '../../lib/demoMode'
+import { useNotifications } from '../../lib/notifications'
 import mapifyitMark from '../../assets/mapifyit-mark.png'
 
 const NAV = [
@@ -45,6 +48,20 @@ export function AppShell() {
   const navigate = useNavigate()
   const isMapRoute = pathname === ROUTES.dashboard
 
+  // Simulates live network/support activity (random equipment status
+  // changes, faults, tickets) so the platform looks "alive" for a demo
+  // before any real IoT/mobile-app data source exists. Lives here (not on
+  // any one page) so it keeps running across navigation. Every event goes
+  // to both the vanishing toast and the persistent notification bell.
+  const { push } = useToast()
+  const { addNotification } = useNotifications()
+  const notify = useCallback((message: string, tone?: 'success' | 'error' | 'info') => {
+    push(message, tone)
+    addNotification(message, tone)
+  }, [push, addNotification])
+  const canRunDemo = hasPermission('assets.approve')
+  const demoMode = useDemoMode(notify)
+
   const linkClass = ({ isActive }: { isActive: boolean }) =>
     clsx(
       'group flex items-center gap-3 rounded-xl text-sm font-semibold transition-colors',
@@ -72,6 +89,22 @@ export function AppShell() {
             </div>
           )}
         </div>
+
+        {canRunDemo && (
+          <button
+            type="button"
+            onClick={demoMode.toggle}
+            title={demoMode.enabled ? 'Demo Mode is ON — simulating live activity. Click to stop.' : 'Demo Mode: simulate live equipment/fault/ticket activity for a demo'}
+            className={clsx(
+              'mb-4 flex shrink-0 items-center gap-2 rounded-xl border text-xs font-bold transition-colors',
+              isMapRoute ? 'h-10 w-10 justify-center' : 'w-full justify-center px-3 py-2.5',
+              demoMode.enabled ? 'border-success-200 bg-success-50 text-success-700' : 'border-slate-200 text-slate-400 hover:bg-slate-50 hover:text-slate-600',
+            )}
+          >
+            <Sparkles size={16} className={demoMode.enabled ? 'animate-pulse' : ''} />
+            {!isMapRoute && (demoMode.enabled ? 'Demo Mode: ON' : 'Demo Mode')}
+          </button>
+        )}
 
         <nav className={clsx('flex-1 overflow-y-auto', isMapRoute ? 'w-full space-y-1' : 'space-y-6')}>
           {isMapRoute ? (
@@ -139,9 +172,7 @@ export function AppShell() {
           <header className="sticky top-0 z-20 flex h-16 shrink-0 items-center gap-3 border-b border-slate-200 bg-white/80 px-6 backdrop-blur">
             <div className="flex-1" />
             <div className="flex items-center gap-1.5">
-              <button type="button" className="grid h-9 w-9 place-items-center rounded-lg text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700">
-                <Bell size={18} />
-              </button>
+              <NotificationBell />
               <div className="mx-1 h-8 w-px bg-slate-200" />
               <Dropdown
                 align="right"

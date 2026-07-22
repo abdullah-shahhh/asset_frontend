@@ -27,7 +27,6 @@ import {
   Moon,
   Sun,
   Trash2,
-  Bell,
   LogOut,
   AlertTriangle,
   Zap,
@@ -56,7 +55,7 @@ import {
   type OperationalStatus,
 } from '../lib/api'
 import { TILES_BASE, mapifyitTransformRequest } from '../lib/maps'
-import { Badge, Button, Card, Checkbox, ConfirmDialog, Dropdown, Input, Modal, Select, Spinner, Textarea, useToast } from '../components/ui'
+import { Badge, Button, Card, Checkbox, ConfirmDialog, Dropdown, Input, Modal, NotificationBell, Select, Spinner, Textarea, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
 import { resolveSymbologyIcon } from '../lib/symbologyIcons'
 import { mediaUrl } from '../theme/branding'
@@ -1386,9 +1385,7 @@ export function MapDashboardPage() {
           )}
 
           <div className="flex-1" />
-          <button type="button" title="Notifications" className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-slate-300 transition-colors hover:bg-white/10 hover:text-white">
-            <Bell size={15} />
-          </button>
+          <NotificationBell dark />
           <div className="mx-1 h-5 w-px bg-white/10" />
           <Dropdown
             align="right"
