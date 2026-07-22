@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import maplibregl, { Map as MapLibreMap } from 'maplibre-gl'
@@ -34,6 +35,9 @@ import {
   Radio,
   Camera,
   Image as ImageIcon,
+  Link,
+  Search,
+  Contact,
 } from 'lucide-react'
 import {
   networkAssetsApi,
@@ -41,11 +45,15 @@ import {
   exportApi,
   downloadGeoJSON,
   mediaApi,
+  connectionsApi,
+  customersApi,
   ApiError,
   type AssetTypeField,
   type GeoJsonGeometry,
   type GeometryType,
   type NetworkAssetFeature,
+  type NetworkConnectionFeature,
+  type OperationalStatus,
 } from '../lib/api'
 import { TILES_BASE, mapifyitTransformRequest } from '../lib/maps'
 import { Badge, Button, Card, Checkbox, ConfirmDialog, Dropdown, Input, Modal, Select, Spinner, Textarea, useToast } from '../components/ui'
@@ -68,7 +76,20 @@ function hexToRgba(hex: string, alpha: number): string {
  * if the org uploaded one, their own custom image. A small status badge —
  * amber dot for pending, red warning triangle for rejected — overlays the
  * corner so problem submissions read at a glance without opening anything. */
-function paintPointMarker(el: HTMLDivElement, color: string, iconKey: string | null, iconUrl: string | null, status: string) {
+const OPERATIONAL_STATUS_COLOR: Record<OperationalStatus, string> = {
+  online: '#22c55e',
+  degraded: '#f59e0b',
+  offline: '#ef4444',
+  maintenance: '#64748b',
+}
+const OPERATIONAL_STATUS_LABEL: Record<OperationalStatus, string> = {
+  online: 'Online',
+  degraded: 'Degraded',
+  offline: 'Offline',
+  maintenance: 'Maintenance',
+}
+
+function paintPointMarker(el: HTMLDivElement, color: string, iconKey: string | null, iconUrl: string | null, status: string, operationalStatus: OperationalStatus | null) {
   el.style.cssText = [
     'width:30px',
     'height:30px',
@@ -95,7 +116,12 @@ function paintPointMarker(el: HTMLDivElement, color: string, iconKey: string | n
       : status === 'pending'
         ? '<span style="position:absolute;top:-2px;right:-2px;width:11px;height:11px;border-radius:9999px;background:#f59e0b;border:2px solid #0a0e1f;"></span>'
         : ''
-  el.innerHTML = iconHtml + badge
+  // Operational (equipment health) status gets its own dot, opposite corner
+  // from the review-status badge above so the two never collide.
+  const statusDot = operationalStatus
+    ? `<span style="position:absolute;bottom:-2px;right:-2px;width:11px;height:11px;border-radius:9999px;background:${OPERATIONAL_STATUS_COLOR[operationalStatus]};border:2px solid #0a0e1f;"></span>`
+    : ''
+  el.innerHTML = iconHtml + badge + statusDot
 }
 /** Paint a draggable vertex handle used while editing an existing shape's
  * geometry. Carries its own delete badge (as a child element with its own
@@ -152,7 +178,7 @@ const FAULT_REASONS = [
   'Connector failure at termination point',
 ]
 
-type Tool = 'point' | 'line' | 'polygon' | 'measure-distance' | 'measure-area' | null
+type Tool = 'point' | 'line' | 'polygon' | 'connect' | 'measure-distance' | 'measure-area' | null
 type BasemapStyle = 'dark' | 'bright'
 
 const METERS_PER_MILE = 1609.344
@@ -234,6 +260,34 @@ export function MapDashboardPage() {
   // Which project's symbologies the draw tools currently offer.
   const [activeProjectId, setActiveProjectId] = useState('')
 
+  // Set once a specific asset should be flown to + selected as soon as its
+  // project's assets have finished loading (used by both the ?asset= URL
+  // param below and the IP search box further down).
+  const [pendingFocusAssetId, setPendingFocusAssetId] = useState<string | null>(null)
+
+  // Arriving from Alarms'/Customers' "View on Map" carries ?project= (and
+  // optionally ?asset=) — apply it once, then drop it from the URL so it
+  // doesn't re-fire on unrelated re-renders.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const appliedProjectParamRef = useRef(false)
+  useEffect(() => {
+    if (appliedProjectParamRef.current) return
+    const projectParam = searchParams.get('project')
+    const assetParam = searchParams.get('asset')
+    if (projectParam) {
+      appliedProjectParamRef.current = true
+      setActiveProjectId(projectParam)
+      if (assetParam) setPendingFocusAssetId(assetParam)
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev)
+        next.delete('project')
+        next.delete('asset')
+        return next
+      }, { replace: true })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // Drawing state.
   const [tool, setTool] = useState<Tool>(null)
   const [linePoints, setLinePoints] = useState<[number, number][]>([])
@@ -247,6 +301,12 @@ export function MapDashboardPage() {
 
   // Selected existing feature (review panel).
   const [selectedFeature, setSelectedFeature] = useState<NetworkAssetFeature | null>(null)
+
+  // Network topology: connect-mode holds the "from" asset id while waiting
+  // for a second click to complete the pair; selectedConnection drives its
+  // own small review panel, mutually exclusive with selectedFeature.
+  const [connectFromId, setConnectFromId] = useState<string | null>(null)
+  const [selectedConnection, setSelectedConnection] = useState<NetworkConnectionFeature | null>(null)
 
   // Geometry editing (drag vertices / add / remove points on an existing asset).
   const [editingFeature, setEditingFeature] = useState<NetworkAssetFeature | null>(null)
@@ -284,6 +344,18 @@ export function MapDashboardPage() {
     queryFn: () => projectsApi.getSymbologies(activeProjectId),
     enabled: !!activeProjectId,
   })
+  const connectionsQuery = useQuery({
+    queryKey: ['network-connections', activeProjectId],
+    queryFn: () => connectionsApi.listForProject(activeProjectId),
+    enabled: !!activeProjectId,
+  })
+  // Which customer (if any) this selected asset serves — shown in its review panel.
+  const assetCustomerQuery = useQuery({
+    queryKey: ['customers', 'by-asset', selectedFeature?.id],
+    queryFn: () => customersApi.list({ networkAssetId: selectedFeature!.id, limit: 1 }),
+    enabled: !!selectedFeature,
+  })
+  const assetCustomer = assetCustomerQuery.data?.items[0] ?? null
 
   const activeProject = (projectsQuery.data?.items ?? []).find((p) => p.id === activeProjectId)
   const projectSymbologies = activeProjectId ? projectSymbologiesQuery.data ?? [] : []
@@ -359,6 +431,106 @@ export function MapDashboardPage() {
     onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to remove asset', 'error'),
   })
 
+  const setOperationalStatus = useMutation({
+    mutationFn: ({ id, operationalStatus }: { id: string; operationalStatus: OperationalStatus }) => networkAssetsApi.update(id, { operationalStatus }),
+    onSuccess: (updated) => {
+      push('Status updated', 'success')
+      setSelectedFeature(updated)
+      invalidateAssets()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to update status', 'error'),
+  })
+
+  const setIpAddress = useMutation({
+    mutationFn: ({ id, ipAddress }: { id: string; ipAddress: string }) => networkAssetsApi.update(id, { ipAddress: ipAddress || null }),
+    onSuccess: (updated) => {
+      push('IP address saved', 'success')
+      setSelectedFeature(updated)
+      invalidateAssets()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to save IP address', 'error'),
+  })
+
+  // IP search from the toolbar: find equipment by IP anywhere in the org,
+  // switch to its project, then fly to + select it once that project's
+  // assets have loaded (can't select before the feature is actually fetched).
+  // Also drives the ?asset= URL param handled above, and the Customer
+  // panel's "View on Map" navigation.
+  const [ipSearchValue, setIpSearchValue] = useState('')
+  useEffect(() => {
+    if (!pendingFocusAssetId) return
+    const feature = assetsQuery.data?.featureCollection.features.find((f) => f.id === pendingFocusAssetId)
+    if (!feature) return
+    setPendingFocusAssetId(null)
+    setSelectedFeature(feature)
+    setSelectedConnection(null)
+    if (feature.geometry.type === 'Point' && mapRef.current) {
+      mapRef.current.flyTo({ center: feature.geometry.coordinates as [number, number], zoom: 17, duration: 600 })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assetsQuery.data, pendingFocusAssetId])
+
+  const ipSearch = useMutation({
+    mutationFn: (query: string) => networkAssetsApi.list({ ipAddress: query, limit: 5 }),
+    onSuccess: (result, query) => {
+      const feature = result.featureCollection.features[0]
+      if (!feature) {
+        push(`No equipment found with an IP matching "${query}"`, 'info')
+        return
+      }
+      setIpSearchValue('')
+      setActiveProjectId(feature.properties.projectId)
+      setPendingFocusAssetId(feature.id)
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Search failed', 'error'),
+  })
+
+  const invalidateConnections = () => queryClient.invalidateQueries({ queryKey: ['network-connections', activeProjectId] })
+
+  const createConnection = useMutation({
+    mutationFn: ({ fromAssetId, toAssetId }: { fromAssetId: string; toAssetId: string }) =>
+      connectionsApi.create({ projectId: activeProjectId, fromAssetId, toAssetId }),
+    onSuccess: () => {
+      push('Connection created', 'success')
+      invalidateConnections()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to create connection', 'error'),
+    onSettled: () => setConnectFromId(null),
+  })
+
+  const removeConnection = useMutation({
+    mutationFn: (id: string) => connectionsApi.remove(id),
+    onSuccess: () => {
+      push('Connection removed', 'success')
+      setSelectedConnection(null)
+      invalidateConnections()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to remove connection', 'error'),
+  })
+
+  // Click-to-connect: the first asset click stashes its id and waits for a
+  // second click to complete the pair. Reads the pending id through a ref
+  // (mirrors editingFeatureRef/toolRef) rather than a functional setState
+  // updater — StrictMode double-invokes updater functions in dev, and the
+  // mutate() call is a side effect that must only ever run once per click.
+  const connectFromIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    connectFromIdRef.current = connectFromId
+  }, [connectFromId])
+
+  function handleConnectClick(feature: NetworkAssetFeature) {
+    const prev = connectFromIdRef.current
+    if (!prev) {
+      setConnectFromId(feature.id)
+      return
+    }
+    if (prev === feature.id) {
+      push('Pick a different asset to finish the connection', 'info')
+      return
+    }
+    createConnection.mutate({ fromAssetId: prev, toAssetId: feature.id })
+  }
+
   // Demo fault simulator — flags a random healthy cable as faulted, right on
   // the live map, so a review-and-fix workflow can be demonstrated end to end.
   const [resolvingFault, setResolvingFault] = useState(false)
@@ -367,6 +539,13 @@ export function MapDashboardPage() {
     setResolvingFault(false)
     setFixReason('')
   }, [selectedFeature?.id])
+
+  // IPAM-lite: local draft of the equipment IP field, reset whenever the
+  // selected asset changes so an unsaved edit doesn't leak onto the next one.
+  const [ipDraft, setIpDraft] = useState('')
+  useEffect(() => {
+    setIpDraft(selectedFeature?.properties.ipAddress ?? '')
+  }, [selectedFeature?.id, selectedFeature?.properties.ipAddress])
 
   const simulateFault = useMutation({
     mutationFn: async () => {
@@ -445,6 +624,7 @@ export function MapDashboardPage() {
     setTemplateValues({})
     setPhotos([])
     setMeasurePoints([])
+    setConnectFromId(null)
   }
 
   function finishShape() {
@@ -464,6 +644,7 @@ export function MapDashboardPage() {
     const wasActive = tool === next
     resetDrawing()
     setSelectedFeature(null)
+    setSelectedConnection(null)
     if (!wasActive) setTool(next)
   }
 
@@ -579,6 +760,11 @@ export function MapDashboardPage() {
     editingFeatureRef.current = editingFeature
   }, [editingFeature])
 
+  const toolRef = useRef<Tool>(null)
+  useEffect(() => {
+    toolRef.current = tool
+  }, [tool])
+
   // Fly to a project's data the first time it loads after being selected —
   // once per selection, not on every background refetch (e.g. after an
   // approve/reject invalidates the query while the same project is active).
@@ -689,6 +875,52 @@ export function MapDashboardPage() {
     }
   }, [showCellTowers, basemapStyle])
 
+  // Network topology overlay — dashed edges between connected assets.
+  // Declared (and thus mounted) before the assets effect below so its layer
+  // is added to the style first, painting underneath the real asset layers.
+  const connectionsClickHandlerRef = useRef<((e: maplibregl.MapLayerMouseEvent) => void) | null>(null)
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const rawFeatures = connectionsQuery.data?.features ?? []
+    const fc = { type: 'FeatureCollection', features: rawFeatures.filter((f) => f.geometry) } as unknown as GeoJSON.FeatureCollection
+
+    const applyData = () => {
+      const source = map.getSource('connections') as maplibregl.GeoJSONSource | undefined
+      if (source) {
+        source.setData(fc)
+        return
+      }
+      map.addSource('connections', { type: 'geojson', data: fc })
+      map.addLayer({
+        id: 'connections-line',
+        type: 'line',
+        source: 'connections',
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: { 'line-color': '#94a3b8', 'line-width': 2, 'line-dasharray': [1.4, 1.4], 'line-opacity': 0.8 },
+      })
+
+      const onConnectionClick = (e: maplibregl.MapLayerMouseEvent) => {
+        if (toolRef.current === 'connect' || editingFeatureRef.current) return
+        const f = e.features?.[0]
+        if (!f?.properties) return
+        const full = rawFeatures.find((x) => x.properties.id === f.properties!.id)
+        if (full) {
+          setSelectedFeature(null)
+          setSelectedConnection(full)
+        }
+      }
+      if (connectionsClickHandlerRef.current) map.off('click', 'connections-line', connectionsClickHandlerRef.current)
+      connectionsClickHandlerRef.current = onConnectionClick
+      map.on('click', 'connections-line', onConnectionClick)
+      map.on('mouseenter', 'connections-line', () => (map.getCanvas().style.cursor = 'pointer'))
+      map.on('mouseleave', 'connections-line', () => (map.getCanvas().style.cursor = ''))
+    }
+
+    if (map.isStyleLoaded()) applyData()
+    else map.once('style.load', applyData)
+  }, [connectionsQuery.data, basemapStyle])
+
   // Existing (submitted) assets layer — clicking one opens the review panel.
   // Re-runs on basemapStyle change too, since setStyle() wipes custom
   // sources/layers and this re-adds them once the new style has loaded.
@@ -771,7 +1003,13 @@ export function MapDashboardPage() {
         const f = e.features?.[0]
         if (!f?.properties) return
         const full = (fc as unknown as { features: NetworkAssetFeature[] }).features.find((x) => x.id === f.properties!.id)
-        if (full) setSelectedFeature(full)
+        if (!full) return
+        if (toolRef.current === 'connect') {
+          handleConnectClick(full)
+          return
+        }
+        setSelectedConnection(null)
+        setSelectedFeature(full)
       }
       assetsClickHandlerRef.current = onFeatureClick
       layers.forEach((id) => {
@@ -807,22 +1045,33 @@ export function MapDashboardPage() {
         seen.add(feature.id)
         const [lng, lat] = feature.geometry.coordinates as [number, number]
         const color = feature.properties.color || FALLBACK_COLOR
+        const equipmentStatus = feature.properties.symbology?.isEquipment ? feature.properties.operationalStatus : null
         const existing = pointMarkersRef.current.get(feature.id)
         if (existing) {
           existing.marker.setLngLat([lng, lat])
-          paintPointMarker(existing.content, color, feature.properties.icon, feature.properties.iconUrl, feature.properties.status)
+          paintPointMarker(existing.content, color, feature.properties.icon, feature.properties.iconUrl, feature.properties.status, equipmentStatus)
           existing.content.onclick = (e) => {
             e.stopPropagation()
-            if (!editingFeatureRef.current) setSelectedFeature(feature)
+            if (editingFeatureRef.current) return
+            if (toolRef.current === 'connect') handleConnectClick(feature)
+            else {
+              setSelectedConnection(null)
+              setSelectedFeature(feature)
+            }
           }
         } else {
           const wrapper = document.createElement('div')
           wrapper.style.cssText = 'display:inline-flex;flex-direction:column;align-items:center;gap:3px;line-height:0'
           const content = document.createElement('div')
-          paintPointMarker(content, color, feature.properties.icon, feature.properties.iconUrl, feature.properties.status)
+          paintPointMarker(content, color, feature.properties.icon, feature.properties.iconUrl, feature.properties.status, equipmentStatus)
           content.onclick = (e) => {
             e.stopPropagation()
-            if (!editingFeatureRef.current) setSelectedFeature(feature)
+            if (editingFeatureRef.current) return
+            if (toolRef.current === 'connect') handleConnectClick(feature)
+            else {
+              setSelectedConnection(null)
+              setSelectedFeature(feature)
+            }
           }
           wrapper.appendChild(content)
           if (feature.properties.symbology && LABELED_SYMBOLOGY_NAMES.has(feature.properties.symbology.name)) {
@@ -1056,6 +1305,14 @@ export function MapDashboardPage() {
   const measureDistance = tool === 'measure-distance' || tool === 'measure-area' ? pathDistanceMeters(tool === 'measure-area' && measurePoints.length >= 3 ? [...measurePoints, measurePoints[0]] : measurePoints) : 0
   const measureArea = tool === 'measure-area' && measurePoints.length >= 3 ? ringAreaSqMeters(measurePoints) : 0
   const featureCount = assetsQuery.data?.featureCollection.features.length ?? 0
+  const connectionCount = connectionsQuery.data?.features.length ?? 0
+  const hasEquipmentAssets = (assetsQuery.data?.featureCollection.features ?? []).some((f) => f.properties.symbology?.isEquipment)
+
+  function connectionAssetLabel(assetId: string): string {
+    const asset = assetsQuery.data?.featureCollection.features.find((f) => f.id === assetId)
+    if (!asset) return 'Unknown asset'
+    return asset.properties.symbology?.name ?? asset.properties.assetType.replace(/_/g, ' ')
+  }
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-white">
@@ -1082,12 +1339,28 @@ export function MapDashboardPage() {
           <ToolbarButton active={tool === 'point'} disabled={!pointSymbologies.length || !!editingFeature} onClick={() => toggleTool('point')} icon={<MapPin size={15} />} label={tool === 'point' ? 'Cancel' : 'Point'} />
           <ToolbarButton active={tool === 'line'} disabled={!lineSymbologies.length || !!editingFeature} onClick={() => toggleTool('line')} icon={<Spline size={15} />} label={tool === 'line' ? 'Cancel' : 'Line'} />
           <ToolbarButton active={tool === 'polygon'} disabled={!polygonSymbologies.length || !!editingFeature} onClick={() => toggleTool('polygon')} icon={<Square size={15} />} label={tool === 'polygon' ? 'Cancel' : 'Polygon'} />
+          {canEditGeometry && (
+            <ToolbarButton active={tool === 'connect'} disabled={featureCount < 2 || !!editingFeature} onClick={() => toggleTool('connect')} icon={<Link size={15} />} label={tool === 'connect' ? 'Cancel' : 'Connect'} />
+          )}
           <div className="mx-1.5 h-5 w-px bg-white/10" />
           <ToolbarButton active={tool === 'measure-distance'} disabled={!!editingFeature} onClick={() => toggleTool('measure-distance')} icon={<Ruler size={15} />} label={tool === 'measure-distance' ? 'Cancel' : 'Distance'} />
           <ToolbarButton active={tool === 'measure-area'} disabled={!!editingFeature} onClick={() => toggleTool('measure-area')} icon={<Pentagon size={15} />} label={tool === 'measure-area' ? 'Cancel' : 'Area'} />
           <div className="mx-1.5 h-5 w-px bg-white/10" />
           <ToolbarButton disabled={!!editingFeature} onClick={() => setImportOpen(true)} icon={<Upload size={15} />} label="Import" />
           <ToolbarButton disabled={!!editingFeature} onClick={() => setExportOpen(true)} icon={<Download size={15} />} label="Export" />
+          <div className="mx-1.5 h-5 w-px bg-white/10" />
+          <div className="relative flex items-center">
+            <Search size={13} className="pointer-events-none absolute left-2.5 text-slate-400" />
+            <input
+              value={ipSearchValue}
+              onChange={(e) => setIpSearchValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && ipSearchValue.trim()) ipSearch.mutate(ipSearchValue.trim())
+              }}
+              placeholder="Search IP…"
+              className="h-7 w-32 rounded-md border border-white/10 bg-white/[0.06] pl-7 pr-2 text-xs font-medium text-slate-100 outline-none placeholder:text-slate-500 focus:ring-2 focus:ring-primary-400/40"
+            />
+          </div>
 
           {canApprove && (
             <>
@@ -1219,7 +1492,7 @@ export function MapDashboardPage() {
               live count of how many of each are on the map right now. Hidden
               while a side panel is open so the two can't collide on shorter
               viewports. */}
-          {activeProjectId && !!symbologyLayers.length && !selectedFeature && !editingFeature && !showForm && (
+          {activeProjectId && !!symbologyLayers.length && !selectedFeature && !editingFeature && !showForm && !selectedConnection && (
             <Card className="absolute bottom-4 right-4 z-20 w-64 overflow-hidden !rounded-lg shadow-[var(--shadow-card-hover)]">
               <div className="flex items-center justify-between gap-1.5 border-b border-slate-100 bg-slate-50 px-3 py-1.5">
                 <span className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
@@ -1253,6 +1526,29 @@ export function MapDashboardPage() {
                     </div>
                   )
                 })}
+                {connectionCount > 0 && (
+                  <div className="mb-2.5">
+                    <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">Network</p>
+                    <div className="flex items-center gap-2 text-xs font-medium text-slate-600">
+                      <span className="h-0 w-3.5 shrink-0 border-t-2 border-dashed border-slate-400" />
+                      <span className="min-w-0 flex-1 truncate">Connections</span>
+                      <span className="tabular-nums text-slate-400">{connectionCount}</span>
+                    </div>
+                  </div>
+                )}
+                {hasEquipmentAssets && (
+                  <div className="mb-0">
+                    <p className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">Equipment Status</p>
+                    <div className="flex flex-wrap gap-x-3 gap-y-1">
+                      {(Object.keys(OPERATIONAL_STATUS_COLOR) as OperationalStatus[]).map((s) => (
+                        <div key={s} className="flex items-center gap-1.5 text-xs font-medium text-slate-600">
+                          <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: OPERATIONAL_STATUS_COLOR[s] }} />
+                          {OPERATIONAL_STATUS_LABEL[s]}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             </Card>
           )}
@@ -1285,6 +1581,18 @@ export function MapDashboardPage() {
               <button onClick={resetDrawing} className="rounded p-1 hover:bg-white/20">
                 <X size={14} />
               </button>
+            </div>
+          )}
+
+          {tool === 'connect' && (
+            <div className="absolute left-1/2 top-4 z-20 flex -translate-x-1/2 items-center gap-2 rounded-lg bg-ink/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">
+              <Link size={13} />
+              <span>{connectFromId ? 'Click the asset to connect it to' : 'Click an asset to start a connection'}</span>
+              {connectFromId && (
+                <button onClick={() => setConnectFromId(null)} className="ml-1 rounded p-1 hover:bg-white/20" title="Start over">
+                  <X size={14} />
+                </button>
+              )}
             </div>
           )}
 
@@ -1393,6 +1701,63 @@ export function MapDashboardPage() {
                   <Badge tone={selectedFeature.properties.status === 'approved' ? 'success' : selectedFeature.properties.status === 'rejected' ? 'danger' : 'warning'} className="mb-3">
                     {selectedFeature.properties.status}
                   </Badge>
+                  {assetCustomer && (
+                    <div className="mb-3 flex items-center gap-2 rounded-lg bg-primary-50 px-2.5 py-2 text-xs">
+                      <Contact size={14} className="shrink-0 text-primary-600" />
+                      <div className="min-w-0">
+                        <div className="font-semibold text-ink">{assetCustomer.name}</div>
+                        <div className="truncate text-primary-700">{assetCustomer.email || assetCustomer.phone || 'Customer on this asset'}</div>
+                      </div>
+                    </div>
+                  )}
+                  {selectedFeature.properties.symbology?.isEquipment && (
+                    <div className="mb-3">
+                      <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                        <Radio size={12} />
+                        Equipment Status
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {(Object.keys(OPERATIONAL_STATUS_COLOR) as OperationalStatus[]).map((s) => {
+                          const active = selectedFeature.properties.operationalStatus === s
+                          return (
+                            <button
+                              key={s}
+                              type="button"
+                              onClick={() => setOperationalStatus.mutate({ id: selectedFeature.id, operationalStatus: s })}
+                              disabled={setOperationalStatus.isPending}
+                              className="flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                              style={
+                                active
+                                  ? { backgroundColor: OPERATIONAL_STATUS_COLOR[s], borderColor: OPERATIONAL_STATUS_COLOR[s], color: '#ffffff' }
+                                  : { borderColor: '#e2e8f0', color: '#475569' }
+                              }
+                            >
+                              <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: active ? '#ffffff' : OPERATIONAL_STATUS_COLOR[s] }} />
+                              {OPERATIONAL_STATUS_LABEL[s]}
+                            </button>
+                          )
+                        })}
+                      </div>
+                      <div className="mt-2 flex items-end gap-1.5">
+                        <Input
+                          label="IP Address"
+                          value={ipDraft}
+                          onChange={(e) => setIpDraft(e.target.value)}
+                          placeholder="e.g. 10.20.30.5"
+                          containerClassName="flex-1"
+                        />
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => setIpAddress.mutate({ id: selectedFeature.id, ipAddress: ipDraft.trim() })}
+                          loading={setIpAddress.isPending}
+                          disabled={ipDraft.trim() === (selectedFeature.properties.ipAddress ?? '')}
+                        >
+                          Save
+                        </Button>
+                      </div>
+                    </div>
+                  )}
                   {Boolean(selectedFeature.properties.attributes?.faultActive) && (
                     <div className="mb-3 rounded-lg border border-danger-200 bg-danger-50 p-2.5">
                       <div className="mb-1 flex items-center gap-1.5 text-xs font-bold text-danger-700">
@@ -1486,6 +1851,38 @@ export function MapDashboardPage() {
                   {canDelete && (
                     <Button variant="danger" leftIcon={<Trash2 size={14} />} onClick={() => setConfirmDeleteId(selectedFeature.id)} className="w-full">
                       Remove from Map
+                    </Button>
+                  )}
+                </div>
+              </Card>
+            </div>
+          )}
+
+          {/* Connection review panel — which two assets this edge links, and a way to remove it. */}
+          {selectedConnection && (
+            <div className="absolute right-4 top-4 z-20 w-80">
+              <Card className="overflow-hidden !rounded-lg shadow-xl">
+                <PanelHeader icon={<Link size={14} />} title="Connection" subtitle={selectedConnection.properties.label || 'Network link'} onClose={() => setSelectedConnection(null)} />
+                <div className="p-4">
+                  <div className="mb-3 space-y-1.5 rounded-lg bg-slate-50 p-2.5 text-xs">
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">From</span>
+                      <span className="font-medium text-ink">{connectionAssetLabel(selectedConnection.properties.fromAssetId)}</span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">To</span>
+                      <span className="font-medium text-ink">{connectionAssetLabel(selectedConnection.properties.toAssetId)}</span>
+                    </div>
+                  </div>
+                  {canEditGeometry && (
+                    <Button
+                      variant="danger"
+                      leftIcon={<Trash2 size={14} />}
+                      onClick={() => removeConnection.mutate(selectedConnection.properties.id)}
+                      loading={removeConnection.isPending}
+                      className="w-full"
+                    >
+                      Remove Connection
                     </Button>
                   )}
                 </div>

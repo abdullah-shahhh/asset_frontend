@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
-import { Map, ClipboardCheck, FolderKanban, Users, HardHat, ShieldCheck, Palette, LogOut, Bell, LifeBuoy, Paintbrush, Settings } from 'lucide-react'
+import { Map, ClipboardCheck, FolderKanban, Users, HardHat, ShieldCheck, Palette, LogOut, Bell, LifeBuoy, Paintbrush, Settings, Radio, Contact, Ticket } from 'lucide-react'
 import clsx from 'clsx'
 import { useAuth } from '../../auth/AuthContext'
 import { ROUTES } from '../../lib/routes'
@@ -11,7 +11,10 @@ import mapifyitMark from '../../assets/mapifyit-mark.png'
 const NAV = [
   { to: ROUTES.dashboard, label: 'Map', icon: Map, end: true, permission: null as string | null },
   { to: ROUTES.submissions, label: 'Submissions', icon: ClipboardCheck, permission: null },
+  { to: ROUTES.alarms, label: 'Alarms', icon: Radio, permission: 'assets.view' },
   { to: ROUTES.projects, label: 'Projects', icon: FolderKanban, permission: null },
+  { to: ROUTES.customers, label: 'Customers', icon: Contact, permission: 'customers.view' },
+  { to: ROUTES.tickets, label: 'Tickets', icon: Ticket, permission: 'tickets.view' },
   { to: ROUTES.fieldTeam, label: 'Field Team', icon: HardHat, permission: 'field_team.view' },
 ]
 

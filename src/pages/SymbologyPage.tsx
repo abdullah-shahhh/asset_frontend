@@ -2,7 +2,7 @@ import { useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { MapPin, Palette, Pencil, Plus, Spline, Square, Trash2, Upload, X } from 'lucide-react'
 import { symbologiesApi, ApiError, type GeometryType, type Symbology } from '../lib/api'
-import { Badge, Button, Card, ConfirmDialog, DataState, EmptyState, Input, Modal, PageHeader, Select, Spinner, Table, TBody, TD, TH, THead, TR, useToast } from '../components/ui'
+import { Badge, Button, Card, Checkbox, ConfirmDialog, DataState, EmptyState, Input, Modal, PageHeader, Select, Spinner, Table, TBody, TD, TH, THead, TR, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
 import { SYMBOLOGY_ICONS, resolveSymbologyIcon } from '../lib/symbologyIcons'
 import { mediaUrl } from '../theme/branding'
@@ -105,6 +105,11 @@ export function SymbologyPage() {
                         <GeometryIcon size={12} />
                         {GEOMETRY_LABEL[s.geometryType]}
                       </Badge>
+                      {s.isEquipment && (
+                        <Badge tone="success" className="ml-1.5">
+                          Equipment
+                        </Badge>
+                      )}
                     </TD>
                     <TD className="text-muted">{s.key}</TD>
                     {canManage && (
@@ -164,6 +169,7 @@ function SymbologyModal({
   const [color, setColor] = useState(editing?.color ?? '#2f4fb4')
   const [icon, setIcon] = useState<string | null>(editing?.icon ?? null)
   const [iconUrl, setIconUrl] = useState<string | null>(editing?.iconUrl ?? null)
+  const [isEquipment, setIsEquipment] = useState(editing?.isEquipment ?? false)
   // A file picked before the symbology exists yet (creation flow) — held
   // locally and uploaded right after the create call succeeds.
   const [pendingFile, setPendingFile] = useState<File | null>(null)
@@ -178,6 +184,7 @@ function SymbologyModal({
     setColor(editing?.color ?? '#2f4fb4')
     setIcon(editing?.icon ?? null)
     setIconUrl(editing?.iconUrl ?? null)
+    setIsEquipment(editing?.isEquipment ?? false)
     setPendingFile(null)
     setPendingPreview(null)
   }
@@ -185,9 +192,9 @@ function SymbologyModal({
   const save = useMutation({
     mutationFn: async () => {
       if (editing) {
-        return symbologiesApi.update(editing.id, { name, color, icon: geometryType === 'Point' ? icon : null })
+        return symbologiesApi.update(editing.id, { name, color, icon: geometryType === 'Point' ? icon : null, isEquipment: geometryType === 'Point' && isEquipment })
       }
-      const created = await symbologiesApi.create({ name, geometryType, color, icon: geometryType === 'Point' ? icon : null })
+      const created = await symbologiesApi.create({ name, geometryType, color, icon: geometryType === 'Point' ? icon : null, isEquipment: geometryType === 'Point' && isEquipment })
       if (pendingFile) await symbologiesApi.uploadIcon(created.id, pendingFile)
       return created
     },
@@ -280,6 +287,14 @@ function SymbologyModal({
             <Input value={color} onChange={(e) => setColor(e.target.value)} containerClassName="flex-1" />
           </div>
         </div>
+
+        {geometryType === 'Point' && (
+          <Checkbox
+            label="Equipment (tracks online/offline status)"
+            checked={isEquipment}
+            onChange={(e) => setIsEquipment(e.target.checked)}
+          />
+        )}
 
         {geometryType === 'Point' && (
           <div>

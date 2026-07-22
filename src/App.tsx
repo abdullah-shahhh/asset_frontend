@@ -5,6 +5,9 @@ import { AppShell } from './components/layout/AppShell'
 import { LoginPage } from './pages/LoginPage'
 import { MapDashboardPage } from './pages/MapDashboardPage'
 import { SubmissionsPage } from './pages/SubmissionsPage'
+import { AlarmsPage } from './pages/AlarmsPage'
+import { CustomersPage } from './pages/CustomersPage'
+import { TicketsPage } from './pages/TicketsPage'
 import { ProjectsPage } from './pages/ProjectsPage'
 import { FieldTeamPage } from './pages/FieldTeamPage'
 import { TeamPage } from './pages/TeamPage'
@@ -26,7 +29,31 @@ export default function App() {
       >
         <Route path={ROUTES.dashboard} element={<MapDashboardPage />} />
         <Route path={ROUTES.submissions} element={<SubmissionsPage />} />
+        <Route
+          path={ROUTES.alarms}
+          element={
+            <RequirePermission permission="assets.view">
+              <AlarmsPage />
+            </RequirePermission>
+          }
+        />
         <Route path={ROUTES.projects} element={<ProjectsPage />} />
+        <Route
+          path={ROUTES.customers}
+          element={
+            <RequirePermission permission="customers.view">
+              <CustomersPage />
+            </RequirePermission>
+          }
+        />
+        <Route
+          path={ROUTES.tickets}
+          element={
+            <RequirePermission permission="tickets.view">
+              <TicketsPage />
+            </RequirePermission>
+          }
+        />
         <Route
           path={ROUTES.fieldTeam}
           element={

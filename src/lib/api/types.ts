@@ -77,11 +77,14 @@ export interface Symbology {
   icon: string | null
   /** A custom-uploaded icon image — takes precedence over `icon` when set. */
   iconUrl: string | null
+  /** Does this symbology represent real equipment that can be online/offline? Org-defined, Point-only. */
+  isEquipment: boolean
   createdAt: string
   updatedAt: string
 }
 
 export type AssetStatus = 'pending' | 'approved' | 'rejected'
+export type OperationalStatus = 'online' | 'degraded' | 'offline' | 'maintenance'
 
 export interface GeoJsonGeometry {
   type: GeometryType
@@ -93,7 +96,7 @@ export interface NetworkAssetProperties {
   projectId: string
   project: { id: string; name: string } | null
   symbologyId: string | null
-  symbology: { id: string; name: string; key: string; color: string; icon: string | null; iconUrl: string | null } | null
+  symbology: { id: string; name: string; key: string; color: string; icon: string | null; iconUrl: string | null; isEquipment: boolean } | null
   color: string | null
   icon: string | null
   iconUrl: string | null
@@ -101,6 +104,8 @@ export interface NetworkAssetProperties {
   geometryType: GeometryType
   attributes: Record<string, unknown>
   status: AssetStatus
+  operationalStatus: OperationalStatus | null
+  ipAddress: string | null
   createdByUserId: string | null
   createdBy: { id: string; name: string; email: string } | null
   reviewedByUserId: string | null
