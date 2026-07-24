@@ -115,6 +115,11 @@ export function SymbologyPage() {
                           Cable
                         </Badge>
                       )}
+                      {s.isRfSite && (
+                        <Badge tone="primary" className="ml-1.5">
+                          RF Site
+                        </Badge>
+                      )}
                     </TD>
                     <TD className="text-muted">{s.key}</TD>
                     {canManage && (
@@ -176,6 +181,7 @@ function SymbologyModal({
   const [iconUrl, setIconUrl] = useState<string | null>(editing?.iconUrl ?? null)
   const [isEquipment, setIsEquipment] = useState(editing?.isEquipment ?? false)
   const [isCable, setIsCable] = useState(editing?.isCable ?? false)
+  const [isRfSite, setIsRfSite] = useState(editing?.isRfSite ?? false)
   const [fields, setFields] = useState<AssetTypeField[]>(editing?.fields ?? [])
   // A file picked before the symbology exists yet (creation flow) — held
   // locally and uploaded right after the create call succeeds.
@@ -193,6 +199,7 @@ function SymbologyModal({
     setIconUrl(editing?.iconUrl ?? null)
     setIsEquipment(editing?.isEquipment ?? false)
     setIsCable(editing?.isCable ?? false)
+    setIsRfSite(editing?.isRfSite ?? false)
     setFields(editing?.fields ?? [])
     setPendingFile(null)
     setPendingPreview(null)
@@ -239,6 +246,7 @@ function SymbologyModal({
           icon: geometryType === 'Point' ? icon : null,
           isEquipment: geometryType === 'Point' && isEquipment,
           isCable: geometryType === 'LineString' && isCable,
+          isRfSite: geometryType === 'Point' && isRfSite,
           fields: cleanFields(),
         })
       }
@@ -249,6 +257,7 @@ function SymbologyModal({
         icon: geometryType === 'Point' ? icon : null,
         isEquipment: geometryType === 'Point' && isEquipment,
         isCable: geometryType === 'LineString' && isCable,
+        isRfSite: geometryType === 'Point' && isRfSite,
         fields: cleanFields(),
       })
       if (pendingFile) await symbologiesApi.uploadIcon(created.id, pendingFile)
@@ -349,6 +358,14 @@ function SymbologyModal({
             label="Equipment (tracks online/offline status)"
             checked={isEquipment}
             onChange={(e) => setIsEquipment(e.target.checked)}
+          />
+        )}
+
+        {geometryType === 'Point' && (
+          <Checkbox
+            label="RF Site (estimates radio coverage from frequency/power/height)"
+            checked={isRfSite}
+            onChange={(e) => setIsRfSite(e.target.checked)}
           />
         )}
 

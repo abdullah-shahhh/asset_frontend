@@ -36,6 +36,21 @@ export interface Project {
   updatedAt: string
 }
 
+export interface ProjectStats {
+  project: { id: string; name: string }
+  totalAssets: number
+  byType: { label: string; count: number }[]
+  statusCounts: { pending: number; approved: number; rejected: number }
+  surveyProgressPct: number
+  damagedAssets: number
+  assetsInMaintenance: number
+  activeFaults: number
+  totalOfcLengthFeet: number
+  strands: { total: number; inService: number; utilizationPct: number }
+  ports: { total: number; connected: number }
+  activeSurveyors: number
+}
+
 export type GeometryType = 'Point' | 'LineString' | 'Polygon'
 
 export interface AssetTypeField {
@@ -81,6 +96,8 @@ export interface Symbology {
   isEquipment: boolean
   /** Does this symbology represent a fiber cable that carries strands? Org-defined, LineString-only. */
   isCable: boolean
+  /** Does this symbology represent a radio transmitter whose coverage can be estimated? Org-defined, Point-only. */
+  isRfSite: boolean
   /** Custom attribute schema for assets of this type. Takes precedence over the project's own templateFields when non-empty. */
   fields: AssetTypeField[]
   createdAt: string
@@ -100,7 +117,18 @@ export interface NetworkAssetProperties {
   projectId: string
   project: { id: string; name: string } | null
   symbologyId: string | null
-  symbology: { id: string; name: string; key: string; color: string; icon: string | null; iconUrl: string | null; isEquipment: boolean; isCable: boolean; fields: AssetTypeField[] } | null
+  symbology: {
+    id: string
+    name: string
+    key: string
+    color: string
+    icon: string | null
+    iconUrl: string | null
+    isEquipment: boolean
+    isCable: boolean
+    isRfSite: boolean
+    fields: AssetTypeField[]
+  } | null
   color: string | null
   icon: string | null
   iconUrl: string | null
@@ -113,6 +141,7 @@ export interface NetworkAssetProperties {
   createdByUserId: string | null
   createdBy: { id: string; name: string; email: string } | null
   reviewedByUserId: string | null
+  reviewedBy: { id: string; name: string; email: string } | null
   reviewedAt: string | null
   rejectionReason: string | null
   media: { id: string; url: string; mimeType: string | null; sizeBytes: number | null; createdAt: string }[]

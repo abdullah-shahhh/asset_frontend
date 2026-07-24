@@ -4,6 +4,7 @@ export const ROUTES = {
   submissions: '/submissions',
   alarms: '/alarms',
   projects: '/projects',
+  projectDashboard: '/projects/:id/dashboard',
   customers: '/customers',
   tickets: '/tickets',
   fieldTeam: '/field-team',
@@ -12,3 +13,7 @@ export const ROUTES = {
   symbologies: '/settings/symbologies',
   branding: '/settings/branding',
 } as const
+
+export function projectDashboardPath(id: string) {
+  return `/projects/${id}/dashboard`
+}

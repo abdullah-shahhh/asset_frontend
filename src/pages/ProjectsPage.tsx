@@ -1,9 +1,11 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { FolderKanban, MapPin, Palette, Plus, Spline, Square, Users } from 'lucide-react'
+import { FolderKanban, LayoutDashboard, MapPin, Palette, Plus, Spline, Square, Users } from 'lucide-react'
 import { fieldTeamApi, projectsApi, symbologiesApi, ApiError, type GeometryType, type Project, type Surveyor, type Symbology } from '../lib/api'
 import { Badge, Button, Card, Checkbox, DataState, EmptyState, Input, Modal, PageHeader, Table, TBody, TD, TH, THead, TR, Textarea, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
+import { projectDashboardPath } from '../lib/routes'
 
 const GEOMETRY_ICON: Record<GeometryType, typeof MapPin> = { Point: MapPin, LineString: Spline, Polygon: Square }
 
@@ -17,13 +19,13 @@ export function ProjectsPage() {
   const canCreate = hasPermission('projects.create')
   const canManageSymbologies = hasPermission('symbologies.manage')
   const canManageSurveyors = hasPermission('projects.update')
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { push } = useToast()
 
   const query = useQuery({ queryKey: ['projects'], queryFn: () => projectsApi.list({ limit: 50 }) })
 
   const projects = query.data?.items ?? []
-  const showActions = canManageSymbologies || canManageSurveyors
   const existingSurveyTypes = Array.from(new Set(projects.map((p) => p.surveyType).filter(Boolean)))
 
   return (
@@ -62,7 +64,7 @@ export function ProjectsPage() {
                 <TH>Type</TH>
                 <TH>Status</TH>
                 <TH>Created</TH>
-                {showActions && <TH className="text-right">Actions</TH>}
+                <TH className="text-right">Actions</TH>
               </TR>
             </THead>
             <TBody>
@@ -82,22 +84,23 @@ export function ProjectsPage() {
                     <Badge tone={p.status === 'active' ? 'success' : 'neutral'}>{p.status}</Badge>
                   </TD>
                   <TD className="text-muted">{new Date(p.createdAt).toLocaleDateString()}</TD>
-                  {showActions && (
-                    <TD className="text-right">
-                      <div className="flex justify-end gap-2">
-                        {canManageSurveyors && (
-                          <Button size="sm" variant="outline" leftIcon={<Users size={14} />} onClick={() => setAssigningSurveyors(p)}>
-                            Surveyors
-                          </Button>
-                        )}
-                        {canManageSymbologies && (
-                          <Button size="sm" variant="outline" leftIcon={<Palette size={14} />} onClick={() => setAssigningProject(p)}>
-                            Symbologies
-                          </Button>
-                        )}
-                      </div>
-                    </TD>
-                  )}
+                  <TD className="text-right">
+                    <div className="flex justify-end gap-2">
+                      <Button size="sm" variant="outline" leftIcon={<LayoutDashboard size={14} />} onClick={() => navigate(projectDashboardPath(p.id))}>
+                        Dashboard
+                      </Button>
+                      {canManageSurveyors && (
+                        <Button size="sm" variant="outline" leftIcon={<Users size={14} />} onClick={() => setAssigningSurveyors(p)}>
+                          Surveyors
+                        </Button>
+                      )}
+                      {canManageSymbologies && (
+                        <Button size="sm" variant="outline" leftIcon={<Palette size={14} />} onClick={() => setAssigningProject(p)}>
+                          Symbologies
+                        </Button>
+                      )}
+                    </div>
+                  </TD>
                 </TR>
               ))}
             </TBody>

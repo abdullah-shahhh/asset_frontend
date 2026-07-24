@@ -1,5 +1,5 @@
 import { api } from './client'
-import type { AssetTypeField, Project, ProjectSurveyType, Symbology } from './types'
+import type { AssetTypeField, Project, ProjectStats, ProjectSurveyType, Symbology } from './types'
 import type { Surveyor } from './fieldTeam.api'
 
 export interface ProjectListParams {
@@ -27,4 +27,5 @@ export const projectsApi = {
   setSymbologies: (id: string, symbologyIds: string[]) => api.put<Symbology[]>(`/v1/org/projects/${id}/symbologies`, { symbologyIds }),
   getSurveyors: (id: string) => api.get<Surveyor[]>(`/v1/org/projects/${id}/surveyors`),
   setSurveyors: (id: string, surveyorIds: string[]) => api.put<Surveyor[]>(`/v1/org/projects/${id}/surveyors`, { surveyorIds }),
+  getStats: (id: string) => api.get<ProjectStats>(`/v1/org/projects/${id}/stats`),
 }

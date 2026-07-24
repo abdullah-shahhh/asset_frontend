@@ -44,6 +44,7 @@ import {
   Keyboard,
   ChevronDown,
   ChevronRight,
+  Antenna,
 } from 'lucide-react'
 import {
   networkAssetsApi,
@@ -86,6 +87,72 @@ function hexToRgba(hex: string, alpha: number): string {
   const g = parseInt(clean.substring(2, 4), 16)
   const b = parseInt(clean.substring(4, 6), 16)
   return `rgba(${r},${g},${b},${alpha})`
+}
+
+/** Destination point given a start [lng,lat], bearing (deg), and distance
+ * (km) — standard spherical earth formula, used to draw coverage-ring
+ * polygons without pulling in a geo library for one calculation. */
+function destinationPoint(lng: number, lat: number, bearingDeg: number, distanceKm: number): [number, number] {
+  const R = 6371
+  const bearing = (bearingDeg * Math.PI) / 180
+  const lat1 = (lat * Math.PI) / 180
+  const lng1 = (lng * Math.PI) / 180
+  const angDist = distanceKm / R
+  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(angDist) + Math.cos(lat1) * Math.sin(angDist) * Math.cos(bearing))
+  const lng2 = lng1 + Math.atan2(Math.sin(bearing) * Math.sin(angDist) * Math.cos(lat1), Math.cos(angDist) - Math.sin(lat1) * Math.sin(lat2))
+  return [(lng2 * 180) / Math.PI, (lat2 * 180) / Math.PI]
+}
+
+/** A closed ring polygon (GeoJSON coordinate array) approximating a circle of
+ * the given radius around a center point. */
+function circlePolygon(center: [number, number], radiusKm: number, steps = 72): [number, number][] {
+  const ring: [number, number][] = []
+  for (let i = 0; i <= steps; i++) {
+    ring.push(destinationPoint(center[0], center[1], (360 * i) / steps, radiusKm))
+  }
+  return ring
+}
+
+export interface RfCoverageRing {
+  label: string
+  color: string
+  radiusKm: number
+}
+
+/**
+ * Urban coverage estimate via the COST-231 Hata model — the standard,
+ * textbook formula for predicting cellular coverage in built-up areas
+ * (extends the classic Hata model to the 1500-2000 MHz band). Assumes a
+ * dense-urban correction factor and a 1.5 m handset height, and — like every
+ * coverage-prediction tool at this level — has no actual terrain or building
+ * data, so treat the radii as a planning estimate, not a certified survey.
+ *   L(dB) = 46.3 + 33.9*log10(f) - 13.82*log10(hb) - a(hm)
+ *           + (44.9 - 6.55*log10(hb))*log10(d) + 3
+ *   a(hm) = (1.1*log10(f) - 0.7)*hm - (1.56*log10(f) - 0.8)
+ */
+function computeRfRings(freqMhz: number, txPowerDbm: number, antennaHeightM: number): RfCoverageRing[] {
+  const thresholds: { label: string; color: string; rxDbm: number }[] = [
+    { label: 'Strong', color: '#16a34a', rxDbm: -75 },
+    { label: 'Good', color: '#84cc16', rxDbm: -85 },
+    { label: 'Fair', color: '#eab308', rxDbm: -95 },
+    { label: 'Weak', color: '#f97316', rxDbm: -105 },
+  ]
+  const hb = Math.max(1, antennaHeightM || 30)
+  const hm = 1.5
+  const logF = Math.log10(freqMhz)
+  const logHb = Math.log10(hb)
+  const aHm = (1.1 * logF - 0.7) * hm - (1.56 * logF - 0.8)
+  const base = 46.3 + 33.9 * logF - 13.82 * logHb - aHm + 3
+  const distanceSlope = 44.9 - 6.55 * logHb
+
+  return thresholds
+    .map(({ label, color, rxDbm }) => {
+      const maxLoss = txPowerDbm - rxDbm
+      const logD = (maxLoss - base) / distanceSlope
+      const radiusKm = Math.max(0.05, 10 ** logD)
+      return { label, color, radiusKm }
+    })
+    .sort((a, b) => b.radiusKm - a.radiusKm)
 }
 
 /** Paint a point marker's content element: colored badge (with a soft glow
@@ -739,6 +806,13 @@ export function MapDashboardPage() {
   useEffect(() => {
     setResolvingFault(false)
     setFixReason('')
+  }, [selectedFeature?.id])
+
+  // RF coverage prediction — off by default, reset whenever the selected
+  // asset changes so a stale coverage overlay doesn't linger after switching.
+  const [showRfCoverage, setShowRfCoverage] = useState(false)
+  useEffect(() => {
+    setShowRfCoverage(false)
   }, [selectedFeature?.id])
 
   // IPAM-lite: local draft of the equipment IP field, reset whenever the
@@ -1588,6 +1662,56 @@ export function MapDashboardPage() {
     runWhenStyleReady(applyMeasure)
   }, [measurePoints, tool, basemapStyle])
 
+  // RF coverage prediction — concentric COST-231 Hata rings around the
+  // selected RF-site asset, largest (weakest) ring first so stronger rings
+  // paint on top of it.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    const isRfSite = selectedFeature?.geometry.type === 'Point' && selectedFeature.properties.symbology?.isRfSite
+    const attrs = selectedFeature?.properties.attributes as Record<string, unknown> | undefined
+    const freqMhz = Number(attrs?.frequencyMhz)
+    const txPowerDbm = Number(attrs?.txPowerDbm)
+    const antennaHeightM = Number(attrs?.antennaHeightM) || 30
+    const showing = showRfCoverage && isRfSite && freqMhz > 0 && Number.isFinite(txPowerDbm)
+
+    const fc: GeoJSON.FeatureCollection = {
+      type: 'FeatureCollection',
+      features:
+        showing && selectedFeature
+          ? computeRfRings(freqMhz, txPowerDbm, antennaHeightM).map((ring) => ({
+              type: 'Feature',
+              geometry: { type: 'Polygon', coordinates: [circlePolygon(selectedFeature.geometry.coordinates as [number, number], ring.radiusKm)] },
+              properties: { label: ring.label, color: ring.color },
+            }))
+          : [],
+    }
+
+    const applyRf = () => {
+      const source = map.getSource('rf-coverage') as maplibregl.GeoJSONSource | undefined
+      if (source) {
+        source.setData(fc)
+        return
+      }
+      map.addSource('rf-coverage', { type: 'geojson', data: fc })
+      map.addLayer({
+        id: 'rf-coverage-fill',
+        type: 'fill',
+        source: 'rf-coverage',
+        paint: { 'fill-color': ['get', 'color'], 'fill-opacity': 0.22 },
+      })
+      map.addLayer({
+        id: 'rf-coverage-outline',
+        type: 'line',
+        source: 'rf-coverage',
+        paint: { 'line-color': ['get', 'color'], 'line-width': 1.5, 'line-opacity': 0.7 },
+      })
+    }
+
+    runWhenStyleReady(applyRf)
+  }, [showRfCoverage, selectedFeature, basemapStyle])
+
   const showForm = Boolean(draftGeometry)
   const missingRequiredField = effectiveFields.some((f) => f.required && !templateValues[f.key])
   const needsPhoto = !!activeProject?.photosRequired && photos.length === 0
@@ -2184,6 +2308,46 @@ export function MapDashboardPage() {
                       </div>
                     </div>
                   )}
+                  {selectedFeature.properties.symbology?.isRfSite && (() => {
+                    const attrs = selectedFeature.properties.attributes as Record<string, unknown>
+                    const freqMhz = Number(attrs.frequencyMhz)
+                    const txPowerDbm = Number(attrs.txPowerDbm)
+                    const antennaHeightM = Number(attrs.antennaHeightM) || 30
+                    const hasRfData = freqMhz > 0 && Number.isFinite(txPowerDbm)
+                    return (
+                      <div className="mb-3">
+                        <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                          <Antenna size={12} />
+                          RF Coverage
+                        </div>
+                        {!hasRfData ? (
+                          <p className="rounded-lg bg-slate-50 p-2 text-xs text-muted">Set Frequency (MHz) and TX Power (dBm) in Attributes below to estimate coverage.</p>
+                        ) : (
+                          <>
+                            <Button size="sm" variant={showRfCoverage ? 'outline' : 'primary'} className="w-full" onClick={() => setShowRfCoverage((v) => !v)}>
+                              {showRfCoverage ? 'Hide Coverage' : 'Show Coverage'}
+                            </Button>
+                            {showRfCoverage && (
+                              <div className="mt-2 flex flex-col gap-1 rounded-lg bg-slate-50 p-2">
+                                {computeRfRings(freqMhz, txPowerDbm, antennaHeightM).map((ring) => (
+                                  <div key={ring.label} className="flex items-center justify-between text-[11px]">
+                                    <span className="flex items-center gap-1.5 font-medium text-slate-600">
+                                      <span className="h-2 w-2 rounded-full" style={{ backgroundColor: ring.color }} />
+                                      {ring.label}
+                                    </span>
+                                    <span className="tabular-nums text-slate-500">~{ring.radiusKm.toFixed(2)} km</span>
+                                  </div>
+                                ))}
+                                <p className="mt-1 text-[10px] leading-snug text-muted">
+                                  COST-231 Hata urban model estimate (no real terrain/building data) — a planning estimate, not a certified survey.
+                                </p>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    )
+                  })()}
                   {selectedFeature.properties.symbology?.isCable && (
                     <div className="mb-3">
                       {strandsQuery.data && strandsQuery.data.length > 0 ? (

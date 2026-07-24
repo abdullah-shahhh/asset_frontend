@@ -8,6 +8,7 @@ import { AlarmsPage } from './pages/AlarmsPage'
 import { CustomersPage } from './pages/CustomersPage'
 import { TicketsPage } from './pages/TicketsPage'
 import { ProjectsPage } from './pages/ProjectsPage'
+import { ProjectDashboardPage } from './pages/ProjectDashboardPage'
 import { FieldTeamPage } from './pages/FieldTeamPage'
 import { TeamPage } from './pages/TeamPage'
 import { RolesPage } from './pages/RolesPage'
@@ -42,6 +43,7 @@ export default function App() {
           }
         />
         <Route path={ROUTES.projects} element={<ProjectsPage />} />
+        <Route path={ROUTES.projectDashboard} element={<ProjectDashboardPage />} />
         <Route
           path={ROUTES.customers}
           element={
