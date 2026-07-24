@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useLocation, useSearchParams } from 'react-router-dom'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import maplibregl, { Map as MapLibreMap } from 'maplibre-gl'
@@ -37,6 +37,13 @@ import {
   Link,
   Search,
   Contact,
+  Cable,
+  Waypoints,
+  Route,
+  Hand,
+  Keyboard,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react'
 import {
   networkAssetsApi,
@@ -46,6 +53,9 @@ import {
   mediaApi,
   connectionsApi,
   customersApi,
+  strandsApi,
+  portsApi,
+  fiberSplicesApi,
   ApiError,
   type AssetTypeField,
   type GeoJsonGeometry,
@@ -53,8 +63,16 @@ import {
   type NetworkAssetFeature,
   type NetworkConnectionFeature,
   type OperationalStatus,
+  type FiberStrand,
+  type EquipmentPort,
+  type StrandStatus,
+  type StrandRole,
+  type FiberTraceResult,
+  type SpliceEndpointRef,
+  type Customer,
 } from '../lib/api'
 import { TILES_BASE, mapifyitTransformRequest } from '../lib/maps'
+import { ROUTES } from '../lib/routes'
 import { Badge, Button, Card, Checkbox, ConfirmDialog, Dropdown, Input, Modal, NotificationBell, Select, Spinner, Textarea, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
 import { resolveSymbologyIcon } from '../lib/symbologyIcons'
@@ -86,6 +104,32 @@ const OPERATIONAL_STATUS_LABEL: Record<OperationalStatus, string> = {
   degraded: 'Degraded',
   offline: 'Offline',
   maintenance: 'Maintenance',
+}
+
+const STRAND_STATUS_TONE: Record<StrandStatus, 'success' | 'warning' | 'danger' | 'neutral' | 'primary' | 'info'> = {
+  available: 'neutral',
+  reserved: 'info',
+  in_service: 'success',
+  dark: 'neutral',
+  faulty: 'danger',
+  under_test: 'warning',
+  under_repair: 'warning',
+  retired: 'neutral',
+}
+const STRAND_STATUS_LABEL: Record<StrandStatus, string> = {
+  available: 'Available',
+  reserved: 'Reserved',
+  in_service: 'In Service',
+  dark: 'Dark',
+  faulty: 'Faulty',
+  under_test: 'Under Test',
+  under_repair: 'Under Repair',
+  retired: 'Retired',
+}
+const STRAND_ROLE_LABEL: Record<StrandRole, string> = {
+  feeder: 'Feeder',
+  distribution: 'Distribution',
+  drop: 'Drop',
 }
 
 function paintPointMarker(el: HTMLDivElement, color: string, iconKey: string | null, iconUrl: string | null, status: string, operationalStatus: OperationalStatus | null) {
@@ -177,7 +221,7 @@ const FAULT_REASONS = [
   'Connector failure at termination point',
 ]
 
-type Tool = 'point' | 'line' | 'polygon' | 'connect' | 'measure-distance' | 'measure-area' | null
+type Tool = 'point' | 'line' | 'polygon' | 'connect' | 'splice' | 'measure-distance' | 'measure-area' | null
 type BasemapStyle = 'dark' | 'bright'
 
 const METERS_PER_MILE = 1609.344
@@ -248,6 +292,19 @@ function formatArea(sqMeters: number): string {
 export function MapDashboardPage() {
   const mapContainer = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
+  // Tracks whether the map's ONE-TIME 'load' event has already fired.
+  // isStyleLoaded() is unreliable as a re-check later on — it can report
+  // false whenever background tiles are still streaming in, long after
+  // custom sources/layers are actually safe to add — so effects that add
+  // sources/layers on data changes must consult this flag instead of
+  // isStyleLoaded()/'style.load' (which, once fired, never fires again).
+  const styleReadyRef = useRef(false)
+  const runWhenStyleReady = (fn: () => void) => {
+    const map = mapRef.current
+    if (!map) return
+    if (styleReadyRef.current) fn()
+    else map.once('load', fn)
+  }
   const queryClient = useQueryClient()
   const { push } = useToast()
   const { user, logout, hasPermission } = useAuth()
@@ -265,16 +322,20 @@ export function MapDashboardPage() {
   const [pendingFocusAssetId, setPendingFocusAssetId] = useState<string | null>(null)
 
   // Arriving from Alarms'/Customers' "View on Map" carries ?project= (and
-  // optionally ?asset=) — apply it once, then drop it from the URL so it
-  // doesn't re-fire on unrelated re-renders.
+  // optionally ?asset=). This page is now mounted permanently for the whole
+  // session (see AppShell — kept alive across navigation so the map doesn't
+  // reload on every tab switch), so this can no longer be a mount-once
+  // effect: it has to react to the URL actually landing on the dashboard
+  // route with these params, then consume (delete) them so it doesn't
+  // re-fire. Gated on pathname so a stray `project`/`asset` query param on
+  // some other page can't be picked up while this component sits hidden.
+  const location = useLocation()
   const [searchParams, setSearchParams] = useSearchParams()
-  const appliedProjectParamRef = useRef(false)
   useEffect(() => {
-    if (appliedProjectParamRef.current) return
+    if (location.pathname !== ROUTES.dashboard) return
     const projectParam = searchParams.get('project')
     const assetParam = searchParams.get('asset')
     if (projectParam) {
-      appliedProjectParamRef.current = true
       setActiveProjectId(projectParam)
       if (assetParam) setPendingFocusAssetId(assetParam)
       setSearchParams((prev) => {
@@ -284,8 +345,7 @@ export function MapDashboardPage() {
         return next
       }, { replace: true })
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [location.pathname, searchParams, setSearchParams])
 
   // Drawing state.
   const [tool, setTool] = useState<Tool>(null)
@@ -296,6 +356,10 @@ export function MapDashboardPage() {
   const [symbologyId, setSymbologyId] = useState('')
   const [notes, setNotes] = useState('')
   const [templateValues, setTemplateValues] = useState<Record<string, string | number | boolean>>({})
+  // Ad-hoc attributes a surveyor adds beyond the symbology's fixed field
+  // schema — stored under attributes._custom so the review panel can render
+  // them distinctly rather than guessing at arbitrary labels via titleize().
+  const [customFields, setCustomFields] = useState<{ label: string; value: string }[]>([])
   const [photos, setPhotos] = useState<File[]>([])
 
   // Selected existing feature (review panel).
@@ -307,12 +371,19 @@ export function MapDashboardPage() {
   const [connectFromId, setConnectFromId] = useState<string | null>(null)
   const [selectedConnection, setSelectedConnection] = useState<NetworkConnectionFeature | null>(null)
 
+  // Fiber splice tool: same two-click pattern as Connect above — the first
+  // click stashes the asset (must be a cable or equipment) and waits for a
+  // second click, then opens the endpoint picker modal for both sides.
+  const [spliceFromAsset, setSpliceFromAsset] = useState<NetworkAssetFeature | null>(null)
+  const [splicePair, setSplicePair] = useState<[NetworkAssetFeature, NetworkAssetFeature] | null>(null)
+
   // Geometry editing (drag vertices / add / remove points on an existing asset).
   const [editingFeature, setEditingFeature] = useState<NetworkAssetFeature | null>(null)
   const [editVertices, setEditVertices] = useState<[number, number][]>([])
 
   const [importOpen, setImportOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
+  const [coordinateEntryOpen, setCoordinateEntryOpen] = useState(false)
 
   // Measurement tool (distance / area) — deliberately kept independent of the
   // asset-drawing draft pipeline above so it can't get tangled with the
@@ -356,12 +427,104 @@ export function MapDashboardPage() {
   })
   const assetCustomer = assetCustomerQuery.data?.items[0] ?? null
 
+  // Fiber strand / equipment port management — only meaningful when the
+  // selected asset's symbology is flagged isCable / isEquipment respectively.
+  // Fetched on demand per selected asset (like connections/customers above),
+  // not embedded on every map asset — a cable can carry up to 288 strands,
+  // which would bloat the main map list fetch if eager-loaded.
+  const strandsQuery = useQuery({
+    queryKey: ['fiber-strands', selectedFeature?.id],
+    queryFn: () => strandsApi.list(selectedFeature!.id),
+    enabled: !!selectedFeature?.properties.symbology?.isCable,
+  })
+  const portsQuery = useQuery({
+    queryKey: ['equipment-ports', selectedFeature?.id],
+    queryFn: () => portsApi.list(selectedFeature!.id),
+    enabled: !!selectedFeature?.properties.symbology?.isEquipment,
+  })
+
+  const [showGenerateStrands, setShowGenerateStrands] = useState(false)
+  const [strandCountChoice, setStrandCountChoice] = useState('96')
+  const [showGeneratePorts, setShowGeneratePorts] = useState(false)
+  const [portCountChoice, setPortCountChoice] = useState('4')
+  const [selectedStrandForEdit, setSelectedStrandForEdit] = useState<FiberStrand | null>(null)
+  const [traceResult, setTraceResult] = useState<FiberTraceResult | null>(null)
+  // Strand/port lists can run into the hundreds — collapsed by default so the
+  // review panel opens short, expand on demand instead of always paying for
+  // the full list's height.
+  const [portsExpanded, setPortsExpanded] = useState(false)
+  const [strandsExpanded, setStrandsExpanded] = useState(false)
+  useEffect(() => {
+    setPortsExpanded(false)
+    setStrandsExpanded(false)
+  }, [selectedFeature?.id])
+
+  const projectCustomersQuery = useQuery({
+    queryKey: ['customers', 'for-project', activeProjectId],
+    queryFn: () => customersApi.list({ limit: 200 }),
+    enabled: !!selectedStrandForEdit,
+  })
+
+  const invalidateStrands = () => queryClient.invalidateQueries({ queryKey: ['fiber-strands', selectedFeature?.id] })
+  const invalidatePorts = () => queryClient.invalidateQueries({ queryKey: ['equipment-ports', selectedFeature?.id] })
+
+  const generateStrands = useMutation({
+    mutationFn: () => strandsApi.generate(selectedFeature!.id, Number(strandCountChoice)),
+    onSuccess: (strands) => {
+      push(`Generated ${strands.length} strands`, 'success')
+      setShowGenerateStrands(false)
+      invalidateStrands()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to generate strands', 'error'),
+  })
+
+  const updateStrand = useMutation({
+    mutationFn: ({ strandId, patch }: { strandId: string; patch: { status?: StrandStatus; role?: StrandRole | null; assignedCustomerId?: string | null; notes?: string | null } }) =>
+      strandsApi.update(selectedFeature!.id, strandId, patch),
+    onSuccess: (strand) => {
+      push('Strand updated', 'success')
+      setSelectedStrandForEdit(strand)
+      invalidateStrands()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to update strand', 'error'),
+  })
+
+  const generatePorts = useMutation({
+    mutationFn: () => portsApi.generate(selectedFeature!.id, Number(portCountChoice)),
+    onSuccess: (ports) => {
+      push(`Generated ${ports.length} ports`, 'success')
+      setShowGeneratePorts(false)
+      invalidatePorts()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to generate ports', 'error'),
+  })
+
+  const updatePortStatus = useMutation({
+    mutationFn: ({ portId, status }: { portId: string; status: EquipmentPort['status'] }) => portsApi.update(selectedFeature!.id, portId, { status }),
+    onSuccess: () => {
+      push('Port updated', 'success')
+      invalidatePorts()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to update port', 'error'),
+  })
+
+  const runTrace = useMutation({
+    mutationFn: (params: { strandId?: string; portId?: string }) => fiberSplicesApi.trace(params),
+    onSuccess: (result) => setTraceResult(result),
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to trace', 'error'),
+  })
+
   const activeProject = (projectsQuery.data?.items ?? []).find((p) => p.id === activeProjectId)
   const projectSymbologies = activeProjectId ? projectSymbologiesQuery.data ?? [] : []
   const pointSymbologies = projectSymbologies.filter((s) => s.geometryType === 'Point')
   const lineSymbologies = projectSymbologies.filter((s) => s.geometryType === 'LineString')
   const polygonSymbologies = projectSymbologies.filter((s) => s.geometryType === 'Polygon')
   const eligibleSymbologies = draftGeometry?.type === 'LineString' ? lineSymbologies : draftGeometry?.type === 'Polygon' ? polygonSymbologies : pointSymbologies
+  const selectedDraftSymbology = eligibleSymbologies.find((s) => s.id === symbologyId)
+  // A symbology's own field schema takes precedence when it has one; falls
+  // back to the project's (older, flat, shared-across-types) fields so
+  // existing projects that haven't set up per-symbology fields yet keep working.
+  const effectiveFields = selectedDraftSymbology?.fields.length ? selectedDraftSymbology.fields : activeProject?.templateFields ?? []
 
   // Distinct symbologies actually present on the map right now — drives the layers panel.
   const symbologyLayers = (() => {
@@ -387,7 +550,9 @@ export function MapDashboardPage() {
   const createAsset = useMutation({
     mutationFn: async () => {
       if (!draftGeometry || !symbologyId || !activeProjectId) throw new Error('Missing fields')
-      const attributes = activeProject?.templateFields.length ? templateValues : notes ? { notes } : {}
+      const cleanCustom = customFields.filter((c) => c.label.trim())
+      const attributes: Record<string, unknown> = effectiveFields.length ? { ...templateValues } : notes ? { notes } : {}
+      if (cleanCustom.length) attributes._custom = cleanCustom
       const created = await networkAssetsApi.create({ projectId: activeProjectId, symbologyId, geometry: draftGeometry, attributes })
       if (photos.length) await Promise.all(photos.map((file) => mediaApi.upload(created.id, file)))
       return created
@@ -448,6 +613,17 @@ export function MapDashboardPage() {
       invalidateAssets()
     },
     onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to save IP address', 'error'),
+  })
+
+  const updateAttributes = useMutation({
+    mutationFn: ({ id, attributes }: { id: string; attributes: Record<string, unknown> }) => networkAssetsApi.update(id, { attributes }),
+    onSuccess: (updated) => {
+      push('Attributes updated', 'success')
+      setSelectedFeature(updated)
+      setEditingAttributes(false)
+      invalidateAssets()
+    },
+    onError: (err) => push(err instanceof ApiError ? err.message : 'Failed to update attributes', 'error'),
   })
 
   // IP search from the toolbar: find equipment by IP anywhere in the org,
@@ -530,6 +706,32 @@ export function MapDashboardPage() {
     createConnection.mutate({ fromAssetId: prev, toAssetId: feature.id })
   }
 
+  // Click-to-splice: same ref-based two-click pattern as Connect above, but
+  // each side needs a specific strand/port picked afterward, so the second
+  // click opens a modal instead of firing a mutation directly.
+  const spliceFromAssetRef = useRef<NetworkAssetFeature | null>(null)
+  useEffect(() => {
+    spliceFromAssetRef.current = spliceFromAsset
+  }, [spliceFromAsset])
+
+  function handleSpliceClick(feature: NetworkAssetFeature) {
+    if (!feature.properties.symbology?.isCable && !feature.properties.symbology?.isEquipment) {
+      push('Only cables and equipment carry strands or ports to splice', 'info')
+      return
+    }
+    const prev = spliceFromAssetRef.current
+    if (!prev) {
+      setSpliceFromAsset(feature)
+      return
+    }
+    if (prev.id === feature.id) {
+      push('Pick a different asset to finish the splice', 'info')
+      return
+    }
+    setSplicePair([prev, feature])
+    setSpliceFromAsset(null)
+  }
+
   // Demo fault simulator — flags a random healthy cable as faulted, right on
   // the live map, so a review-and-fix workflow can be demonstrated end to end.
   const [resolvingFault, setResolvingFault] = useState(false)
@@ -545,6 +747,20 @@ export function MapDashboardPage() {
   useEffect(() => {
     setIpDraft(selectedFeature?.properties.ipAddress ?? '')
   }, [selectedFeature?.id, selectedFeature?.properties.ipAddress])
+
+  // Manager attribute editing — schema-field values plus the custom-field
+  // list, both prefilled from the asset's current attributes and reset
+  // whenever a different asset is selected.
+  const [editingAttributes, setEditingAttributes] = useState(false)
+  const [attrDraft, setAttrDraft] = useState<Record<string, string | number | boolean>>({})
+  const [attrCustomDraft, setAttrCustomDraft] = useState<{ label: string; value: string }[]>([])
+  useEffect(() => {
+    setEditingAttributes(false)
+    const attrs = selectedFeature?.properties.attributes ?? {}
+    const { _custom, ...rest } = attrs as Record<string, unknown> & { _custom?: { label: string; value: string }[] }
+    setAttrDraft(rest as Record<string, string | number | boolean>)
+    setAttrCustomDraft(Array.isArray(_custom) ? _custom : [])
+  }, [selectedFeature?.id])
 
   const simulateFault = useMutation({
     mutationFn: async () => {
@@ -621,9 +837,11 @@ export function MapDashboardPage() {
     setSymbologyId('')
     setNotes('')
     setTemplateValues({})
+    setCustomFields([])
     setPhotos([])
     setMeasurePoints([])
     setConnectFromId(null)
+    setSpliceFromAsset(null)
   }
 
   function finishShape() {
@@ -687,6 +905,10 @@ export function MapDashboardPage() {
     // construction, before this listener existed to catch its 'zoom' event.
     setZoom(map.getZoom())
     mapRef.current = map
+    ;(window as unknown as { __debugMap?: maplibregl.Map }).__debugMap = map
+    map.once('load', () => {
+      styleReadyRef.current = true
+    })
 
     // The map container's width changes when the sidebar's collapse
     // animation runs (AppShell's icon-rail transition) — that's a layout
@@ -714,13 +936,18 @@ export function MapDashboardPage() {
     }
   }, [])
 
+  // Drops whatever tool/edit/selection is active and returns to plain
+  // pan-and-zoom — used by both Escape and the explicit Hand/Pan toolbar
+  // button, so there's always a visible, discoverable way out of a tool.
+  function exitToNormalMode() {
+    if (editingFeature) cancelEditGeometry()
+    else if (tool || draftGeometry) resetDrawing()
+    else if (selectedFeature) setSelectedFeature(null)
+  }
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') {
-        if (editingFeature) cancelEditGeometry()
-        else if (tool || draftGeometry) resetDrawing()
-        else if (selectedFeature) setSelectedFeature(null)
-      }
+      if (e.key === 'Escape') exitToNormalMode()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -763,6 +990,15 @@ export function MapDashboardPage() {
   useEffect(() => {
     toolRef.current = tool
   }, [tool])
+
+  // Mirrors draftGeometry into a ref for the same reason toolRef exists: the
+  // point-marker click handlers below live inside an effect that doesn't
+  // re-run on every draftGeometry change, so reading draftGeometry directly
+  // in those closures would see a stale value.
+  const draftGeometryRef = useRef<GeoJsonGeometry | null>(null)
+  useEffect(() => {
+    draftGeometryRef.current = draftGeometry
+  }, [draftGeometry])
 
   // Fly to a project's data the first time it loads after being selected —
   // once per selection, not on every background refetch (e.g. after an
@@ -900,7 +1136,7 @@ export function MapDashboardPage() {
       })
 
       const onConnectionClick = (e: maplibregl.MapLayerMouseEvent) => {
-        if (toolRef.current === 'connect' || editingFeatureRef.current) return
+        if (toolRef.current === 'connect' || toolRef.current === 'splice' || editingFeatureRef.current) return
         const f = e.features?.[0]
         if (!f?.properties) return
         const full = rawFeatures.find((x) => x.properties.id === f.properties!.id)
@@ -916,14 +1152,19 @@ export function MapDashboardPage() {
       map.on('mouseleave', 'connections-line', () => (map.getCanvas().style.cursor = ''))
     }
 
-    if (map.isStyleLoaded()) applyData()
-    else map.once('style.load', applyData)
+    runWhenStyleReady(applyData)
   }, [connectionsQuery.data, basemapStyle])
 
   // Existing (submitted) assets layer — clicking one opens the review panel.
   // Re-runs on basemapStyle change too, since setStyle() wipes custom
   // sources/layers and this re-adds them once the new style has loaded.
-  const assetsClickHandlerRef = useRef<((e: maplibregl.MapLayerMouseEvent) => void) | null>(null)
+  const assetsClickHandlerRef = useRef<((e: maplibregl.MapMouseEvent) => void) | null>(null)
+  // The click handler is bound once (when the 'assets' source/layers are
+  // first created) and never rebound after — later effect runs just call
+  // source.setData(). It reads the latest feature collection from this ref
+  // rather than closing over the fc built during binding, which would
+  // otherwise go stale after the first data refresh.
+  const assetsFcRef = useRef<GeoJSON.FeatureCollection>({ type: 'FeatureCollection', features: [] })
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
@@ -931,12 +1172,8 @@ export function MapDashboardPage() {
     if (!rawFc) {
       // No project selected (or its data hasn't loaded yet) — keep the map
       // clean rather than showing stale assets from a previously selected project.
-      const clear = () => {
-        const source = map.getSource('assets') as maplibregl.GeoJSONSource | undefined
-        source?.setData({ type: 'FeatureCollection', features: [] })
-      }
-      if (map.isStyleLoaded()) clear()
-      else map.once('style.load', clear)
+      const source = map.getSource('assets') as maplibregl.GeoJSONSource | undefined
+      source?.setData({ type: 'FeatureCollection', features: [] })
       return
     }
 
@@ -948,6 +1185,7 @@ export function MapDashboardPage() {
         // the feature so the line-width expression below can thicken it.
         .map((f) => (f.properties.attributes?.faultActive ? { ...f, properties: { ...f.properties, color: '#ef4444', faulted: true } } : f)),
     } as GeoJSON.FeatureCollection
+    assetsFcRef.current = fc
 
     const symbologyColor = ['coalesce', ['get', 'color'], FALLBACK_COLOR] as unknown as maplibregl.ExpressionSpecification
     const statusOpacity = ['match', ['get', 'status'], 'rejected', 0.3, 'pending', 0.65, 1] as unknown as maplibregl.ExpressionSpecification
@@ -994,32 +1232,44 @@ export function MapDashboardPage() {
         paint: { 'line-color': symbologyColor, 'line-width': lineWidth, 'line-opacity': statusOpacity },
       })
       const layers = ['assets-lines', 'assets-polygons']
-      if (assetsClickHandlerRef.current) {
-        layers.forEach((id) => map.off('click', id, assetsClickHandlerRef.current!))
-      }
-      const onFeatureClick = (e: maplibregl.MapLayerMouseEvent) => {
+      if (assetsClickHandlerRef.current) map.off('click', assetsClickHandlerRef.current)
+      // A single map-level handler (instead of one per-layer listener each)
+      // so a click landing on both a cable and a large background polygon
+      // (survey area, project boundary) it happens to cross always picks the
+      // cable — lines and points take priority over polygons, never the
+      // reverse, regardless of which layer maplibre happens to hit-test first.
+      const onFeatureClick = (e: maplibregl.MapMouseEvent) => {
         if (editingFeatureRef.current) return
-        const f = e.features?.[0]
+        const hits = map.queryRenderedFeatures(e.point, { layers })
+        const f = hits.find((h) => h.geometry.type === 'LineString') ?? hits[0]
         if (!f?.properties) return
-        const full = (fc as unknown as { features: NetworkAssetFeature[] }).features.find((x) => x.id === f.properties!.id)
+        const full = (assetsFcRef.current as unknown as { features: NetworkAssetFeature[] }).features.find((x) => x.id === f.properties!.id)
         if (!full) return
         if (toolRef.current === 'connect') {
           handleConnectClick(full)
+          return
+        }
+        if (toolRef.current === 'splice') {
+          handleSpliceClick(full)
           return
         }
         setSelectedConnection(null)
         setSelectedFeature(full)
       }
       assetsClickHandlerRef.current = onFeatureClick
+      map.on('click', onFeatureClick)
       layers.forEach((id) => {
-        map.on('click', id, onFeatureClick)
         map.on('mouseenter', id, () => (map.getCanvas().style.cursor = 'pointer'))
         map.on('mouseleave', id, () => (map.getCanvas().style.cursor = ''))
       })
     }
 
-    if (map.isStyleLoaded()) applyData()
-    else map.once('style.load', applyData)
+    // isStyleLoaded() reports false whenever background tiles are still
+    // streaming in (unrelated to whether OUR sources/layers are safe to
+    // add), which made this intermittently never create the asset
+    // lines/polygons layers — runWhenStyleReady tracks the map's real
+    // one-time 'load' event instead.
+    runWhenStyleReady(applyData)
   }, [assetsQuery.data, hiddenSymbologyIds, basemapStyle])
 
   // Point assets render as icon markers (not a GPU circle layer) so each one
@@ -1053,7 +1303,18 @@ export function MapDashboardPage() {
             e.stopPropagation()
             if (editingFeatureRef.current) return
             if (toolRef.current === 'connect') handleConnectClick(feature)
-            else {
+            else if (toolRef.current === 'splice') handleSpliceClick(feature)
+            else if ((toolRef.current === 'line' || toolRef.current === 'polygon') && !draftGeometryRef.current) {
+              // Drawing a line/polygon: clicking an existing point snaps that
+              // exact coordinate in as the next vertex instead of opening its
+              // review panel — this is how you connect a wire to real assets
+              // rather than an approximate nearby spot.
+              setLinePoints((pts) => [...pts, feature.geometry.coordinates as [number, number]])
+            } else if (toolRef.current === 'line' || toolRef.current === 'polygon') {
+              // Shape already finished (draftGeometry set) — fall through to normal select.
+              setSelectedConnection(null)
+              setSelectedFeature(feature)
+            } else {
               setSelectedConnection(null)
               setSelectedFeature(feature)
             }
@@ -1067,7 +1328,18 @@ export function MapDashboardPage() {
             e.stopPropagation()
             if (editingFeatureRef.current) return
             if (toolRef.current === 'connect') handleConnectClick(feature)
-            else {
+            else if (toolRef.current === 'splice') handleSpliceClick(feature)
+            else if ((toolRef.current === 'line' || toolRef.current === 'polygon') && !draftGeometryRef.current) {
+              // Drawing a line/polygon: clicking an existing point snaps that
+              // exact coordinate in as the next vertex instead of opening its
+              // review panel — this is how you connect a wire to real assets
+              // rather than an approximate nearby spot.
+              setLinePoints((pts) => [...pts, feature.geometry.coordinates as [number, number]])
+            } else if (toolRef.current === 'line' || toolRef.current === 'polygon') {
+              // Shape already finished (draftGeometry set) — fall through to normal select.
+              setSelectedConnection(null)
+              setSelectedFeature(feature)
+            } else {
               setSelectedConnection(null)
               setSelectedFeature(feature)
             }
@@ -1147,14 +1419,23 @@ export function MapDashboardPage() {
   // the vertex counts this app deals with.
   const editVertexMarkersRef = useRef<maplibregl.Marker[]>([])
   const editMidpointMarkersRef = useRef<maplibregl.Marker[]>([])
+
+  // Vertex (drag-handle) markers. Deliberately keyed on editVertices.length,
+  // not the full array: each marker.on('drag', ...) below calls
+  // setEditVertices on every mousemove tick, and maplibregl.Marker.remove()
+  // unbinds the map-level mousemove/mouseup listeners it uses to track an
+  // in-progress drag — so rebuilding on every coordinate change tore down
+  // the very marker being dragged mid-gesture (it would move one pixel and
+  // then stop following the cursor). Markers only need to be (re)created
+  // when entering/leaving edit mode or when the vertex COUNT changes (add
+  // via midpoint click, delete via the per-vertex button); a marker already
+  // tracks and renders its own drag position natively in between.
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
 
     editVertexMarkersRef.current.forEach((m) => m.remove())
     editVertexMarkersRef.current = []
-    editMidpointMarkersRef.current.forEach((m) => m.remove())
-    editMidpointMarkersRef.current = []
 
     if (!editingFeature) return
     const geomType = editingFeature.geometry.type
@@ -1182,28 +1463,43 @@ export function MapDashboardPage() {
       }
       editVertexMarkersRef.current.push(marker)
     })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingFeature, editVertices.length])
 
-    if (geomType !== 'Point') {
-      const segments: { a: [number, number]; b: [number, number]; insertAt: number }[] = []
-      for (let i = 0; i < editVertices.length - 1; i++) segments.push({ a: editVertices[i], b: editVertices[i + 1], insertAt: i + 1 })
-      if (geomType === 'Polygon' && editVertices.length >= 2) segments.push({ a: editVertices[editVertices.length - 1], b: editVertices[0], insertAt: editVertices.length })
+  // Midpoint ("insert vertex here") markers. These have no drag state to
+  // preserve, so rebuilding them on every coordinate change (to stay
+  // positioned at the true segment midpoints while a vertex is dragged) is
+  // cheap and correct — unlike the vertex markers above.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
 
-      segments.forEach(({ a, b, insertAt }) => {
-        const mid: [number, number] = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]
-        const el = document.createElement('div')
-        paintMidpointMarker(el)
-        const marker = new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat(mid).addTo(map)
-        el.onclick = (e) => {
-          e.stopPropagation()
-          setEditVertices((prev) => {
-            const next = [...prev]
-            next.splice(insertAt, 0, mid)
-            return next
-          })
-        }
-        editMidpointMarkersRef.current.push(marker)
-      })
-    }
+    editMidpointMarkersRef.current.forEach((m) => m.remove())
+    editMidpointMarkersRef.current = []
+
+    if (!editingFeature) return
+    const geomType = editingFeature.geometry.type
+    if (geomType === 'Point') return
+
+    const segments: { a: [number, number]; b: [number, number]; insertAt: number }[] = []
+    for (let i = 0; i < editVertices.length - 1; i++) segments.push({ a: editVertices[i], b: editVertices[i + 1], insertAt: i + 1 })
+    if (geomType === 'Polygon' && editVertices.length >= 2) segments.push({ a: editVertices[editVertices.length - 1], b: editVertices[0], insertAt: editVertices.length })
+
+    segments.forEach(({ a, b, insertAt }) => {
+      const mid: [number, number] = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]
+      const el = document.createElement('div')
+      paintMidpointMarker(el)
+      const marker = new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat(mid).addTo(map)
+      el.onclick = (e) => {
+        e.stopPropagation()
+        setEditVertices((prev) => {
+          const next = [...prev]
+          next.splice(insertAt, 0, mid)
+          return next
+        })
+      }
+      editMidpointMarkersRef.current.push(marker)
+    })
   }, [editingFeature, editVertices])
 
   // Draft (in-progress) drawing layer.
@@ -1258,8 +1554,7 @@ export function MapDashboardPage() {
       map.addLayer({ id: 'draft-vertices', type: 'circle', source: 'draft', filter: ['==', ['geometry-type'], 'Point'], paint: { 'circle-radius': 5, 'circle-color': '#2f4fb4', 'circle-stroke-width': 2, 'circle-stroke-color': '#ffffff' } })
     }
 
-    if (map.isStyleLoaded()) applyDraft()
-    else map.once('style.load', applyDraft)
+    runWhenStyleReady(applyDraft)
   }, [draftGeometry, linePoints, editingFeature, editVertices, basemapStyle])
 
   // Measurement layer — a distinct amber dashed style so it reads as a
@@ -1291,13 +1586,11 @@ export function MapDashboardPage() {
       map.addLayer({ id: 'measure-vertices', type: 'circle', source: 'measure', filter: ['==', ['geometry-type'], 'Point'], paint: { 'circle-radius': 4, 'circle-color': '#f59e0b', 'circle-stroke-width': 2, 'circle-stroke-color': '#ffffff' } })
     }
 
-    if (map.isStyleLoaded()) applyMeasure()
-    else map.once('style.load', applyMeasure)
+    runWhenStyleReady(applyMeasure)
   }, [measurePoints, tool, basemapStyle])
 
   const showForm = Boolean(draftGeometry)
-  const templateFields = activeProject?.templateFields ?? []
-  const missingRequiredField = templateFields.some((f) => f.required && !templateValues[f.key])
+  const missingRequiredField = effectiveFields.some((f) => f.required && !templateValues[f.key])
   const needsPhoto = !!activeProject?.photosRequired && photos.length === 0
   const submitDisabled = !symbologyId || missingRequiredField || needsPhoto
   const canFinishShape = (tool === 'line' && linePoints.length >= 2) || (tool === 'polygon' && linePoints.length >= 3)
@@ -1335,11 +1628,21 @@ export function MapDashboardPage() {
             ))}
           </select>
           <div className="mx-1.5 h-5 w-px bg-white/10" />
+          <ToolbarButton
+            active={!tool && !editingFeature && !selectedFeature}
+            disabled={!tool && !editingFeature && !selectedFeature}
+            onClick={exitToNormalMode}
+            icon={<Hand size={15} />}
+            label="Pan"
+          />
           <ToolbarButton active={tool === 'point'} disabled={!pointSymbologies.length || !!editingFeature} onClick={() => toggleTool('point')} icon={<MapPin size={15} />} label={tool === 'point' ? 'Cancel' : 'Point'} />
           <ToolbarButton active={tool === 'line'} disabled={!lineSymbologies.length || !!editingFeature} onClick={() => toggleTool('line')} icon={<Spline size={15} />} label={tool === 'line' ? 'Cancel' : 'Line'} />
           <ToolbarButton active={tool === 'polygon'} disabled={!polygonSymbologies.length || !!editingFeature} onClick={() => toggleTool('polygon')} icon={<Square size={15} />} label={tool === 'polygon' ? 'Cancel' : 'Polygon'} />
           {canEditGeometry && (
             <ToolbarButton active={tool === 'connect'} disabled={featureCount < 2 || !!editingFeature} onClick={() => toggleTool('connect')} icon={<Link size={15} />} label={tool === 'connect' ? 'Cancel' : 'Connect'} />
+          )}
+          {canEditGeometry && (
+            <ToolbarButton active={tool === 'splice'} disabled={featureCount < 2 || !!editingFeature} onClick={() => toggleTool('splice')} icon={<Cable size={15} />} label={tool === 'splice' ? 'Cancel' : 'Splice'} />
           )}
           <div className="mx-1.5 h-5 w-px bg-white/10" />
           <ToolbarButton active={tool === 'measure-distance'} disabled={!!editingFeature} onClick={() => toggleTool('measure-distance')} icon={<Ruler size={15} />} label={tool === 'measure-distance' ? 'Cancel' : 'Distance'} />
@@ -1561,7 +1864,14 @@ export function MapDashboardPage() {
           )}
 
           {tool === 'point' && !draftGeometry && (
-            <div className="absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded-lg bg-ink/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">Click the map to place a point</div>
+            <div className="absolute left-1/2 top-4 z-20 flex -translate-x-1/2 items-center gap-2 rounded-lg bg-ink/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">
+              <span>Click the map to place a point</span>
+              <span className="h-3.5 w-px bg-white/20" />
+              <button onClick={() => setCoordinateEntryOpen(true)} className="flex items-center gap-1 rounded p-1 text-white/80 hover:bg-white/20 hover:text-white">
+                <Keyboard size={13} />
+                Enter coordinates
+              </button>
+            </div>
           )}
 
           {(tool === 'line' || tool === 'polygon') && !draftGeometry && (
@@ -1578,6 +1888,11 @@ export function MapDashboardPage() {
               <button onClick={resetDrawing} className="rounded p-1 hover:bg-white/20">
                 <X size={14} />
               </button>
+              <span className="h-3.5 w-px bg-white/20" />
+              <button onClick={() => setCoordinateEntryOpen(true)} className="flex items-center gap-1 rounded p-1 text-white/80 hover:bg-white/20 hover:text-white">
+                <Keyboard size={13} />
+                Enter coordinates
+              </button>
             </div>
           )}
 
@@ -1587,6 +1902,18 @@ export function MapDashboardPage() {
               <span>{connectFromId ? 'Click the asset to connect it to' : 'Click an asset to start a connection'}</span>
               {connectFromId && (
                 <button onClick={() => setConnectFromId(null)} className="ml-1 rounded p-1 hover:bg-white/20" title="Start over">
+                  <X size={14} />
+                </button>
+              )}
+            </div>
+          )}
+
+          {tool === 'splice' && (
+            <div className="absolute left-1/2 top-4 z-20 flex -translate-x-1/2 items-center gap-2 rounded-lg bg-ink/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">
+              <Cable size={13} />
+              <span>{spliceFromAsset ? 'Click the cable or equipment to splice it to' : 'Click a cable or equipment asset to start a splice'}</span>
+              {spliceFromAsset && (
+                <button onClick={() => setSpliceFromAsset(null)} className="ml-1 rounded p-1 hover:bg-white/20" title="Start over">
                   <X size={14} />
                 </button>
               )}
@@ -1621,7 +1948,7 @@ export function MapDashboardPage() {
             <div className="absolute right-4 top-4 z-20 w-80">
               <Card className="overflow-hidden !rounded-lg shadow-xl">
                 <PanelHeader icon={<MapPin size={14} />} title={`New ${draftGeometry && GEOMETRY_LABEL[draftGeometry.type]} Asset`} right={<Badge tone="neutral">{draftGeometry?.type}</Badge>} />
-                <div className="p-4">
+                <div className="max-h-[calc(100vh-8rem)] overflow-y-auto p-4">
                   <Select
                     label="Symbology"
                     value={symbologyId}
@@ -1631,8 +1958,8 @@ export function MapDashboardPage() {
                     containerClassName="mb-3"
                   />
 
-                  {templateFields.length > 0 ? (
-                    templateFields.map((f) => (
+                  {effectiveFields.length > 0 ? (
+                    effectiveFields.map((f) => (
                       <TemplateFieldInput
                         key={f.key}
                         field={f}
@@ -1643,6 +1970,34 @@ export function MapDashboardPage() {
                   ) : (
                     <Textarea label="Notes (optional)" value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} containerClassName="mb-3" />
                   )}
+
+                  <div className="mb-3">
+                    <div className="mb-1.5 flex items-center justify-between">
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Custom Fields</span>
+                    </div>
+                    {customFields.map((c, i) => (
+                      <div key={i} className="mb-1.5 flex items-center gap-1.5">
+                        <Input
+                          value={c.label}
+                          onChange={(e) => setCustomFields((prev) => prev.map((cf, idx) => (idx === i ? { ...cf, label: e.target.value } : cf)))}
+                          placeholder="Label, e.g. Jober"
+                          containerClassName="flex-1"
+                        />
+                        <Input
+                          value={c.value}
+                          onChange={(e) => setCustomFields((prev) => prev.map((cf, idx) => (idx === i ? { ...cf, value: e.target.value } : cf)))}
+                          placeholder="Value"
+                          containerClassName="flex-1"
+                        />
+                        <button type="button" onClick={() => setCustomFields((prev) => prev.filter((_, idx) => idx !== i))} className="shrink-0 rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-danger-600">
+                          <X size={14} />
+                        </button>
+                      </div>
+                    ))}
+                    <Button type="button" size="sm" variant="outline" onClick={() => setCustomFields((prev) => [...prev, { label: '', value: '' }])}>
+                      + Add custom field
+                    </Button>
+                  </div>
 
                   <div className="mb-3">
                     <label className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold text-slate-700">
@@ -1694,7 +2049,7 @@ export function MapDashboardPage() {
                   subtitle={selectedFeature.properties.geometryType}
                   onClose={() => setSelectedFeature(null)}
                 />
-                <div className="p-4">
+                <div className="max-h-[calc(100vh-8rem)] overflow-y-auto p-4">
                   <Badge tone={selectedFeature.properties.status === 'approved' ? 'success' : selectedFeature.properties.status === 'rejected' ? 'danger' : 'warning'} className="mb-3">
                     {selectedFeature.properties.status}
                   </Badge>
@@ -1753,6 +2108,153 @@ export function MapDashboardPage() {
                           Save
                         </Button>
                       </div>
+
+                      <div className="mt-3">
+                        {portsQuery.data && portsQuery.data.length > 0 ? (
+                          <button
+                            type="button"
+                            onClick={() => setPortsExpanded((v) => !v)}
+                            className="mb-1.5 flex w-full items-center justify-between gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400 hover:text-slate-600"
+                          >
+                            <span className="flex items-center gap-1.5">
+                              <Waypoints size={12} />
+                              Ports ({portsQuery.data.length})
+                            </span>
+                            {portsExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                          </button>
+                        ) : (
+                          <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                            <Waypoints size={12} />
+                            Ports
+                          </div>
+                        )}
+                        {portsQuery.data && portsQuery.data.length > 0 && !portsExpanded && (
+                          <div className="flex flex-wrap gap-1">
+                            {portsQuery.data.slice(0, 8).map((port) => (
+                              <span key={port.id} className={`h-2 w-2 rounded-full ${port.status === 'connected' ? 'bg-success-500' : 'bg-slate-300'}`} title={`Port ${port.portNumber}: ${port.status}`} />
+                            ))}
+                            {portsQuery.data.length > 8 && <span className="text-[10px] text-slate-400">+{portsQuery.data.length - 8}</span>}
+                          </div>
+                        )}
+                        {portsQuery.data && portsQuery.data.length > 0 && portsExpanded ? (
+                          <div className="max-h-48 space-y-1 overflow-y-auto rounded-lg bg-slate-50 p-1.5">
+                            {portsQuery.data.map((port) => (
+                              <div key={port.id} className="flex items-center justify-between gap-2 rounded-md bg-white px-2 py-1.5 text-xs ring-1 ring-slate-100">
+                                <span className="font-semibold text-ink">Port {port.portNumber}</span>
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => updatePortStatus.mutate({ portId: port.id, status: port.status === 'free' ? 'connected' : 'free' })}
+                                    disabled={updatePortStatus.isPending}
+                                    className="disabled:opacity-50"
+                                  >
+                                    <Badge tone={port.status === 'connected' ? 'success' : 'neutral'}>{port.status === 'connected' ? 'Connected' : 'Free'}</Badge>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    title="Trace impact from this port"
+                                    onClick={() => runTrace.mutate({ portId: port.id })}
+                                    className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-primary-600"
+                                  >
+                                    <Route size={13} />
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : portsQuery.data && portsQuery.data.length > 0 ? null : showGeneratePorts ? (
+                          <div className="flex items-end gap-1.5">
+                            <Input
+                              label="Port count"
+                              type="number"
+                              min={1}
+                              max={1000}
+                              value={portCountChoice}
+                              onChange={(e) => setPortCountChoice(e.target.value)}
+                              containerClassName="flex-1"
+                            />
+                            <Button size="sm" onClick={() => generatePorts.mutate()} loading={generatePorts.isPending}>
+                              Generate
+                            </Button>
+                          </div>
+                        ) : (
+                          <Button size="sm" variant="outline" className="w-full" onClick={() => setShowGeneratePorts(true)}>
+                            Generate Ports
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  {selectedFeature.properties.symbology?.isCable && (
+                    <div className="mb-3">
+                      {strandsQuery.data && strandsQuery.data.length > 0 ? (
+                        <button
+                          type="button"
+                          onClick={() => setStrandsExpanded((v) => !v)}
+                          className="mb-1.5 flex w-full items-center justify-between gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400 hover:text-slate-600"
+                        >
+                          <span className="flex items-center gap-1.5">
+                            <Cable size={12} />
+                            Strands ({strandsQuery.data.length})
+                          </span>
+                          {strandsExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                        </button>
+                      ) : (
+                        <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                          <Cable size={12} />
+                          Strands
+                        </div>
+                      )}
+                      {strandsQuery.data && strandsQuery.data.length > 0 && !strandsExpanded && (
+                        <div className="flex flex-wrap gap-1">
+                          {strandsQuery.data.slice(0, 12).map((strand) => (
+                            <span
+                              key={strand.id}
+                              className="h-2.5 w-2.5 rounded-full ring-1 ring-slate-200"
+                              style={{ backgroundColor: strand.color.toLowerCase() }}
+                              title={`Strand #${strand.strandNumber}: ${STRAND_STATUS_LABEL[strand.status]}`}
+                            />
+                          ))}
+                          {strandsQuery.data.length > 12 && <span className="text-[10px] text-slate-400">+{strandsQuery.data.length - 12}</span>}
+                        </div>
+                      )}
+                      {strandsQuery.data && strandsQuery.data.length > 0 && strandsExpanded ? (
+                        <div className="max-h-64 space-y-1 overflow-y-auto rounded-lg bg-slate-50 p-1.5">
+                          {strandsQuery.data.map((strand) => (
+                            <button
+                              key={strand.id}
+                              type="button"
+                              onClick={() => setSelectedStrandForEdit(strand)}
+                              className="flex w-full items-center justify-between gap-2 rounded-md bg-white px-2 py-1.5 text-left text-xs ring-1 ring-slate-100 hover:ring-primary-200"
+                            >
+                              <div className="flex min-w-0 items-center gap-2">
+                                <span className="h-2.5 w-2.5 shrink-0 rounded-full ring-1 ring-slate-200" style={{ backgroundColor: strand.color.toLowerCase() }} />
+                                <span className="font-semibold text-ink">#{strand.strandNumber}</span>
+                                <span className="text-muted">Tube {strand.tubeNumber}</span>
+                                {strand.assignedCustomer && <span className="truncate text-primary-600">· {strand.assignedCustomer.name}</span>}
+                              </div>
+                              <Badge tone={STRAND_STATUS_TONE[strand.status]}>{STRAND_STATUS_LABEL[strand.status]}</Badge>
+                            </button>
+                          ))}
+                        </div>
+                      ) : strandsQuery.data && strandsQuery.data.length > 0 ? null : showGenerateStrands ? (
+                        <div className="flex items-end gap-1.5">
+                          <Select
+                            label="Strand count"
+                            value={strandCountChoice}
+                            onChange={(e) => setStrandCountChoice(e.target.value)}
+                            options={[12, 24, 48, 96, 144, 288].map((n) => ({ value: String(n), label: `${n}F` }))}
+                            containerClassName="flex-1"
+                          />
+                          <Button size="sm" onClick={() => generateStrands.mutate()} loading={generateStrands.isPending}>
+                            Generate
+                          </Button>
+                        </div>
+                      ) : (
+                        <Button size="sm" variant="outline" className="w-full" onClick={() => setShowGenerateStrands(true)}>
+                          Generate Strands
+                        </Button>
+                      )}
                     </div>
                   )}
                   {Boolean(selectedFeature.properties.attributes?.faultActive) && (
@@ -1781,18 +2283,93 @@ export function MapDashboardPage() {
                       )}
                     </div>
                   )}
-                  {Object.entries(selectedFeature.properties.attributes || {}).filter(([k]) => !k.startsWith('fault')).length > 0 && (
-                    <div className="mb-3 space-y-1 rounded-lg bg-slate-50 p-2.5 text-xs">
-                      {Object.entries(selectedFeature.properties.attributes)
-                        .filter(([k]) => !k.startsWith('fault'))
-                        .map(([k, v]) => (
-                          <div key={k} className="flex justify-between gap-2">
-                            <span className="text-muted">{titleize(k)}</span>
-                            <span className="font-medium text-ink">{String(v)}</span>
+                  {(() => {
+                    const rawAttrs = Object.entries(selectedFeature.properties.attributes || {}).filter(([k]) => !k.startsWith('fault') && k !== '_custom')
+                    const customList = ((selectedFeature.properties.attributes as Record<string, unknown> | undefined)?._custom as { label: string; value: string }[] | undefined) ?? []
+                    const schemaFields = selectedFeature.properties.symbology?.fields ?? []
+                    if (!rawAttrs.length && !customList.length && !schemaFields.length) return null
+                    return (
+                      <div className="mb-3">
+                        <div className="mb-1.5 flex items-center justify-between">
+                          <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Attributes</span>
+                          {canEditGeometry && !editingAttributes && (
+                            <button type="button" onClick={() => setEditingAttributes(true)} className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-primary-600" title="Edit attributes">
+                              <PenLine size={13} />
+                            </button>
+                          )}
+                        </div>
+                        {editingAttributes ? (
+                          <div className="space-y-2 rounded-lg bg-slate-50 p-2.5">
+                            {schemaFields.map((f) => (
+                              <TemplateFieldInput key={f.key} field={f} value={attrDraft[f.key]} onChange={(v) => setAttrDraft((prev) => ({ ...prev, [f.key]: v }))} />
+                            ))}
+                            <div>
+                              <span className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-400">Custom Fields</span>
+                              {attrCustomDraft.map((c, i) => (
+                                <div key={i} className="mb-1.5 flex items-center gap-1.5">
+                                  <Input
+                                    value={c.label}
+                                    onChange={(e) => setAttrCustomDraft((prev) => prev.map((cf, idx) => (idx === i ? { ...cf, label: e.target.value } : cf)))}
+                                    placeholder="Label"
+                                    containerClassName="flex-1"
+                                  />
+                                  <Input
+                                    value={c.value}
+                                    onChange={(e) => setAttrCustomDraft((prev) => prev.map((cf, idx) => (idx === i ? { ...cf, value: e.target.value } : cf)))}
+                                    placeholder="Value"
+                                    containerClassName="flex-1"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => setAttrCustomDraft((prev) => prev.filter((_, idx) => idx !== i))}
+                                    className="shrink-0 rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-danger-600"
+                                  >
+                                    <X size={14} />
+                                  </button>
+                                </div>
+                              ))}
+                              <Button type="button" size="sm" variant="outline" onClick={() => setAttrCustomDraft((prev) => [...prev, { label: '', value: '' }])}>
+                                + Add custom field
+                              </Button>
+                            </div>
+                            <div className="flex gap-2 pt-1">
+                              <Button size="sm" variant="outline" className="flex-1" onClick={() => setEditingAttributes(false)}>
+                                Cancel
+                              </Button>
+                              <Button
+                                size="sm"
+                                className="flex-1"
+                                loading={updateAttributes.isPending}
+                                onClick={() => {
+                                  const cleanCustom = attrCustomDraft.filter((c) => c.label.trim())
+                                  const nextAttrs: Record<string, unknown> = { ...attrDraft }
+                                  if (cleanCustom.length) nextAttrs._custom = cleanCustom
+                                  updateAttributes.mutate({ id: selectedFeature.id, attributes: nextAttrs })
+                                }}
+                              >
+                                Save
+                              </Button>
+                            </div>
                           </div>
-                        ))}
-                    </div>
-                  )}
+                        ) : (
+                          <div className="space-y-1 rounded-lg bg-slate-50 p-2.5 text-xs">
+                            {rawAttrs.map(([k, v]) => (
+                              <div key={k} className="flex justify-between gap-2">
+                                <span className="text-muted">{titleize(k)}</span>
+                                <span className="font-medium text-ink">{String(v)}</span>
+                              </div>
+                            ))}
+                            {customList.map((c, i) => (
+                              <div key={`custom-${i}`} className="flex justify-between gap-2">
+                                <span className="text-muted">{c.label}</span>
+                                <span className="font-medium text-ink">{c.value}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })()}
                   {selectedFeature.properties.status === 'rejected' && selectedFeature.properties.rejectionReason && (
                     <div className="mb-3 rounded-lg border border-danger-200 bg-danger-50 p-2.5 text-xs text-danger-700">
                       <span className="font-semibold">Reason: </span>
@@ -1946,12 +2523,429 @@ export function MapDashboardPage() {
         onConfirm={() => confirmDeleteId && removeAsset.mutate(confirmDeleteId)}
         onClose={() => setConfirmDeleteId(null)}
       />
+
+      <StrandEditorModal
+        strand={selectedStrandForEdit}
+        customers={projectCustomersQuery.data?.items ?? []}
+        saving={updateStrand.isPending}
+        onClose={() => setSelectedStrandForEdit(null)}
+        onSave={(patch) => selectedStrandForEdit && updateStrand.mutate({ strandId: selectedStrandForEdit.id, patch })}
+        onTrace={() => selectedStrandForEdit && runTrace.mutate({ strandId: selectedStrandForEdit.id })}
+        tracing={runTrace.isPending}
+      />
+
+      <TraceResultModal result={traceResult} onClose={() => setTraceResult(null)} />
+
+      <CoordinateEntryModal
+        open={coordinateEntryOpen}
+        tool={tool}
+        existingLinePoints={linePoints}
+        onClose={() => setCoordinateEntryOpen(false)}
+        onSubmitPoint={(lngVal, latVal) => {
+          setDraftGeometry({ type: 'Point', coordinates: [lngVal, latVal] })
+          setCoordinateEntryOpen(false)
+        }}
+        onSubmitShape={(points) => {
+          setLinePoints(points)
+          if (tool === 'polygon') setDraftGeometry({ type: 'Polygon', coordinates: [[...points, points[0]]] })
+          else setDraftGeometry({ type: 'LineString', coordinates: points })
+          setCoordinateEntryOpen(false)
+        }}
+      />
+
+      <CreateSpliceModal
+        pair={splicePair}
+        projectId={activeProjectId}
+        onClose={() => setSplicePair(null)}
+        onCreated={() => {
+          setSplicePair(null)
+          push('Splice created', 'success')
+          if (splicePair) {
+            queryClient.invalidateQueries({ queryKey: ['fiber-strands', splicePair[0].id] })
+            queryClient.invalidateQueries({ queryKey: ['fiber-strands', splicePair[1].id] })
+            queryClient.invalidateQueries({ queryKey: ['equipment-ports', splicePair[0].id] })
+            queryClient.invalidateQueries({ queryKey: ['equipment-ports', splicePair[1].id] })
+          }
+        }}
+        pushToast={push}
+      />
     </div>
   )
 }
 
 function titleize(key: string): string {
   return key.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase())
+}
+
+/** Parses one "lat, lng" pair per line. Returns [lng, lat] tuples (GeoJSON
+ * order) plus any row-level error messages, so the caller can show exactly
+ * what's wrong instead of a single generic failure. */
+function parseCoordinateRows(text: string): { points: [number, number][]; errors: string[] } {
+  const points: [number, number][] = []
+  const errors: string[] = []
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean)
+  lines.forEach((line, i) => {
+    const parts = line.split(',').map((p) => p.trim())
+    if (parts.length !== 2) {
+      errors.push(`Line ${i + 1}: expected "latitude, longitude"`)
+      return
+    }
+    const lat = Number(parts[0])
+    const lng = Number(parts[1])
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90) {
+      errors.push(`Line ${i + 1}: latitude must be between -90 and 90`)
+      return
+    }
+    if (!Number.isFinite(lng) || lng < -180 || lng > 180) {
+      errors.push(`Line ${i + 1}: longitude must be between -180 and 180`)
+      return
+    }
+    points.push([lng, lat])
+  })
+  return { points, errors }
+}
+
+function CoordinateEntryModal({
+  open,
+  tool,
+  existingLinePoints,
+  onClose,
+  onSubmitPoint,
+  onSubmitShape,
+}: {
+  open: boolean
+  tool: Tool
+  existingLinePoints: [number, number][]
+  onClose: () => void
+  onSubmitPoint: (lng: number, lat: number) => void
+  onSubmitShape: (points: [number, number][]) => void
+}) {
+  const [lat, setLat] = useState('')
+  const [lng, setLng] = useState('')
+  const [rows, setRows] = useState('')
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    setLat('')
+    setLng('')
+    // Prefill with any points already placed by clicking, so coordinate entry
+    // can finish a shape that was started on the map instead of only
+    // replacing it — displayed as "lat, lng" (human order), stored as [lng, lat].
+    setRows(existingLinePoints.map(([plng, plat]) => `${plat}, ${plng}`).join('\n'))
+    setError(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
+
+  if (!open) return null
+
+  const isPoint = tool === 'point'
+  const minPoints = tool === 'polygon' ? 3 : 2
+
+  function submit() {
+    if (isPoint) {
+      const latNum = Number(lat)
+      const lngNum = Number(lng)
+      if (!Number.isFinite(latNum) || latNum < -90 || latNum > 90) return setError('Latitude must be between -90 and 90')
+      if (!Number.isFinite(lngNum) || lngNum < -180 || lngNum > 180) return setError('Longitude must be between -180 and 180')
+      onSubmitPoint(lngNum, latNum)
+      return
+    }
+    const { points, errors } = parseCoordinateRows(rows)
+    if (errors.length) return setError(errors[0])
+    if (points.length < minPoints) return setError(`Enter at least ${minPoints} points`)
+    onSubmitShape(points)
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`Enter Coordinates — ${isPoint ? 'Point' : tool === 'polygon' ? 'Polygon' : 'Line'}`}
+      subtitle={isPoint ? 'Exact latitude and longitude for this asset' : `One "latitude, longitude" pair per line, at least ${minPoints}`}
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>Cancel</Button>
+          <Button onClick={submit}>Use These Coordinates</Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        {error && <div className="rounded-lg border border-danger-200 bg-danger-50 px-3 py-2 text-xs text-danger-700">{error}</div>}
+        {isPoint ? (
+          <div className="flex gap-2">
+            <Input label="Latitude" value={lat} onChange={(e) => setLat(e.target.value)} placeholder="e.g. 32.7767" containerClassName="flex-1" />
+            <Input label="Longitude" value={lng} onChange={(e) => setLng(e.target.value)} placeholder="e.g. -96.7970" containerClassName="flex-1" />
+          </div>
+        ) : (
+          <Textarea
+            label="Coordinates"
+            value={rows}
+            onChange={(e) => setRows(e.target.value)}
+            rows={8}
+            placeholder={'32.7767, -96.7970\n32.7801, -96.8012\n32.7790, -96.7955'}
+          />
+        )}
+      </div>
+    </Modal>
+  )
+}
+
+function StrandEditorModal({
+  strand,
+  customers,
+  saving,
+  tracing,
+  onClose,
+  onSave,
+  onTrace,
+}: {
+  strand: FiberStrand | null
+  customers: Customer[]
+  saving: boolean
+  tracing: boolean
+  onClose: () => void
+  onSave: (patch: { status?: StrandStatus; role?: StrandRole | null; assignedCustomerId?: string | null; notes?: string | null }) => void
+  onTrace: () => void
+}) {
+  const [status, setStatus] = useState<StrandStatus>(strand?.status ?? 'available')
+  const [role, setRole] = useState<StrandRole | ''>(strand?.role ?? '')
+  const [assignedCustomerId, setAssignedCustomerId] = useState(strand?.assignedCustomerId ?? '')
+  const [notes, setNotes] = useState(strand?.notes ?? '')
+
+  const strandId = strand?.id ?? null
+  const [lastStrandId, setLastStrandId] = useState<string | null>(strandId)
+  if (strandId !== lastStrandId) {
+    setLastStrandId(strandId)
+    setStatus(strand?.status ?? 'available')
+    setRole(strand?.role ?? '')
+    setAssignedCustomerId(strand?.assignedCustomerId ?? '')
+    setNotes(strand?.notes ?? '')
+  }
+
+  if (!strand) return null
+
+  return (
+    <Modal
+      open={!!strand}
+      onClose={onClose}
+      title={`Strand #${strand.strandNumber}`}
+      subtitle={`Tube ${strand.tubeNumber} · ${strand.color}`}
+      footer={
+        <>
+          <Button variant="outline" leftIcon={<Route size={14} />} onClick={onTrace} loading={tracing}>
+            Trace Impact
+          </Button>
+          <Button
+            onClick={() =>
+              onSave({
+                status,
+                role: role || null,
+                assignedCustomerId: assignedCustomerId || null,
+                notes: notes || null,
+              })
+            }
+            loading={saving}
+          >
+            Save Changes
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <Select
+          label="Status"
+          value={status}
+          onChange={(e) => setStatus(e.target.value as StrandStatus)}
+          options={(Object.keys(STRAND_STATUS_LABEL) as StrandStatus[]).map((s) => ({ value: s, label: STRAND_STATUS_LABEL[s] }))}
+        />
+        <Select
+          label="Role"
+          value={role}
+          onChange={(e) => setRole(e.target.value as StrandRole | '')}
+          placeholder="Not set"
+          options={(Object.keys(STRAND_ROLE_LABEL) as StrandRole[]).map((r) => ({ value: r, label: STRAND_ROLE_LABEL[r] }))}
+        />
+        <Select
+          label="Assigned Customer / Home"
+          value={assignedCustomerId}
+          onChange={(e) => setAssignedCustomerId(e.target.value)}
+          placeholder="None"
+          options={customers.map((c) => ({ value: c.id, label: c.name }))}
+        />
+        <Textarea label="Notes" value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} placeholder="Splice details, test results, anything else worth recording." />
+      </div>
+    </Modal>
+  )
+}
+
+/** Picks a specific strand+side (cable) or port (equipment) on one asset —
+ * the sub-record selection a plain two-asset Connect click can't express. */
+function SpliceEndpointPicker({
+  asset,
+  value,
+  onChange,
+}: {
+  asset: NetworkAssetFeature
+  value: SpliceEndpointRef | null
+  onChange: (ref: SpliceEndpointRef | null) => void
+}) {
+  const isCable = !!asset.properties.symbology?.isCable
+  const strandsQuery = useQuery({ queryKey: ['fiber-strands', asset.id], queryFn: () => strandsApi.list(asset.id), enabled: isCable })
+  const portsQuery = useQuery({ queryKey: ['equipment-ports', asset.id], queryFn: () => portsApi.list(asset.id), enabled: !isCable })
+
+  if (isCable) {
+    const strands = strandsQuery.data ?? []
+    return (
+      <div className="flex gap-1.5">
+        <Select
+          label={`${asset.properties.symbology?.name ?? 'Cable'} — Strand`}
+          value={value?.strandId ?? ''}
+          onChange={(e) => onChange(e.target.value ? { type: 'strand', strandId: e.target.value, side: value?.side ?? 'A' } : null)}
+          placeholder={strands.length ? 'Choose a strand' : 'No strands generated yet'}
+          options={strands.map((s) => ({ value: s.id, label: `#${s.strandNumber} (Tube ${s.tubeNumber})` }))}
+          containerClassName="flex-1"
+        />
+        <Select
+          label="Side"
+          value={value?.side ?? 'A'}
+          onChange={(e) => value?.strandId && onChange({ type: 'strand', strandId: value.strandId, side: e.target.value as 'A' | 'Z' })}
+          options={[{ value: 'A', label: 'A' }, { value: 'Z', label: 'Z' }]}
+          disabled={!value?.strandId}
+        />
+      </div>
+    )
+  }
+
+  const ports = portsQuery.data ?? []
+  return (
+    <Select
+      label={`${asset.properties.symbology?.name ?? 'Equipment'} — Port`}
+      value={value?.portId ?? ''}
+      onChange={(e) => onChange(e.target.value ? { type: 'port', portId: e.target.value } : null)}
+      placeholder={ports.length ? 'Choose a port' : 'No ports generated yet'}
+      options={ports.map((p) => ({ value: p.id, label: `Port ${p.portNumber} (${p.status})` }))}
+    />
+  )
+}
+
+function CreateSpliceModal({
+  pair,
+  projectId,
+  onClose,
+  onCreated,
+  pushToast,
+}: {
+  pair: [NetworkAssetFeature, NetworkAssetFeature] | null
+  projectId: string
+  onClose: () => void
+  onCreated: () => void
+  pushToast: (m: string, t?: 'success' | 'error' | 'info') => void
+}) {
+  const [endA, setEndA] = useState<SpliceEndpointRef | null>(null)
+  const [endB, setEndB] = useState<SpliceEndpointRef | null>(null)
+  const [notes, setNotes] = useState('')
+
+  const pairId = pair ? `${pair[0].id}-${pair[1].id}` : null
+  const [lastPairId, setLastPairId] = useState<string | null>(pairId)
+  if (pairId !== lastPairId) {
+    setLastPairId(pairId)
+    setEndA(null)
+    setEndB(null)
+    setNotes('')
+  }
+
+  const create = useMutation({
+    mutationFn: () => {
+      if (!endA || !endB) throw new Error('Pick both endpoints first')
+      return fiberSplicesApi.create({ projectId, endA, endB, notes: notes || undefined })
+    },
+    onSuccess: onCreated,
+    onError: (err) => pushToast(err instanceof ApiError ? err.message : 'Failed to create splice', 'error'),
+  })
+
+  if (!pair) return null
+
+  return (
+    <Modal
+      open={!!pair}
+      onClose={onClose}
+      title="Create Splice"
+      subtitle="Connect a specific strand or port on each side"
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>Cancel</Button>
+          <Button onClick={() => create.mutate()} loading={create.isPending} disabled={!endA || !endB}>
+            Create Splice
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-4">
+        <SpliceEndpointPicker asset={pair[0]} value={endA} onChange={setEndA} />
+        <SpliceEndpointPicker asset={pair[1]} value={endB} onChange={setEndB} />
+        <Textarea label="Notes (optional)" value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} />
+      </div>
+    </Modal>
+  )
+}
+
+function TraceResultModal({ result, onClose }: { result: FiberTraceResult | null; onClose: () => void }) {
+  if (!result) return null
+  return (
+    <Modal open={!!result} onClose={onClose} title="Trace Impact" subtitle="Everything reachable through the splice graph from this point" footer={<Button onClick={onClose}>Close</Button>}>
+      <div className="flex flex-col gap-4">
+        <div>
+          <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">Strands ({result.strands.length})</p>
+          {result.strands.length ? (
+            <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg bg-slate-50 p-1.5">
+              {result.strands.map((s) => (
+                <div key={s.id} className="flex items-center justify-between rounded-md bg-white px-2 py-1.5 text-xs ring-1 ring-slate-100">
+                  <span className="font-semibold text-ink">Strand #{s.strandNumber}</span>
+                  <Badge tone={STRAND_STATUS_TONE[s.status]}>{STRAND_STATUS_LABEL[s.status]}</Badge>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-muted">None reached.</p>
+          )}
+        </div>
+        <div>
+          <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">Ports ({result.ports.length})</p>
+          {result.ports.length ? (
+            <div className="max-h-32 space-y-1 overflow-y-auto rounded-lg bg-slate-50 p-1.5">
+              {result.ports.map((p) => (
+                <div key={p.id} className="flex items-center justify-between rounded-md bg-white px-2 py-1.5 text-xs ring-1 ring-slate-100">
+                  <span className="font-semibold text-ink">Port {p.portNumber}</span>
+                  <Badge tone={p.status === 'connected' ? 'success' : 'neutral'}>{p.status === 'connected' ? 'Connected' : 'Free'}</Badge>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-muted">None reached.</p>
+          )}
+        </div>
+        <div>
+          <p className="mb-1.5 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+            <Contact size={12} />
+            Customers Affected ({result.customers.length})
+          </p>
+          {result.customers.length ? (
+            <div className="space-y-1">
+              {result.customers.map((c) => (
+                <div key={c.id} className="flex items-center justify-between rounded-lg bg-danger-50 px-2.5 py-2 text-xs">
+                  <span className="font-semibold text-danger-700">{c.name}</span>
+                  <span className="text-danger-600">{c.email || c.phone || ''}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-muted">No customer directly attributed to anything reached.</p>
+          )}
+        </div>
+      </div>
+    </Modal>
+  )
 }
 
 function initials(name?: string): string {

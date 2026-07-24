@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { MapPin, Palette, Pencil, Plus, Spline, Square, Trash2, Upload, X } from 'lucide-react'
-import { symbologiesApi, ApiError, type GeometryType, type Symbology } from '../lib/api'
+import { symbologiesApi, ApiError, type AssetTypeField, type GeometryType, type Symbology } from '../lib/api'
 import { Badge, Button, Card, Checkbox, ConfirmDialog, DataState, EmptyState, Input, Modal, PageHeader, Select, Spinner, Table, TBody, TD, TH, THead, TR, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
 import { SYMBOLOGY_ICONS, resolveSymbologyIcon } from '../lib/symbologyIcons'
@@ -110,6 +110,11 @@ export function SymbologyPage() {
                           Equipment
                         </Badge>
                       )}
+                      {s.isCable && (
+                        <Badge tone="info" className="ml-1.5">
+                          Cable
+                        </Badge>
+                      )}
                     </TD>
                     <TD className="text-muted">{s.key}</TD>
                     {canManage && (
@@ -170,6 +175,8 @@ function SymbologyModal({
   const [icon, setIcon] = useState<string | null>(editing?.icon ?? null)
   const [iconUrl, setIconUrl] = useState<string | null>(editing?.iconUrl ?? null)
   const [isEquipment, setIsEquipment] = useState(editing?.isEquipment ?? false)
+  const [isCable, setIsCable] = useState(editing?.isCable ?? false)
+  const [fields, setFields] = useState<AssetTypeField[]>(editing?.fields ?? [])
   // A file picked before the symbology exists yet (creation flow) — held
   // locally and uploaded right after the create call succeeds.
   const [pendingFile, setPendingFile] = useState<File | null>(null)
@@ -185,16 +192,65 @@ function SymbologyModal({
     setIcon(editing?.icon ?? null)
     setIconUrl(editing?.iconUrl ?? null)
     setIsEquipment(editing?.isEquipment ?? false)
+    setIsCable(editing?.isCable ?? false)
+    setFields(editing?.fields ?? [])
     setPendingFile(null)
     setPendingPreview(null)
+  }
+
+  function slugifyKey(label: string): string {
+    const words = label
+      .trim()
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean)
+    return words.map((w, i) => (i === 0 ? w : w[0].toUpperCase() + w.slice(1))).join('') || 'field'
+  }
+
+  function addField() {
+    setFields((prev) => [...prev, { key: '', label: '', type: 'text', required: false }])
+  }
+  function updateField(index: number, patch: Partial<AssetTypeField>) {
+    setFields((prev) => prev.map((f, i) => (i === index ? { ...f, ...patch, ...(patch.label !== undefined ? { key: slugifyKey(patch.label) } : {}) } : f)))
+  }
+  function removeField(index: number) {
+    setFields((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  // Drop rows the user started but never labeled, and de-dupe keys that
+  // collided after slugifying (e.g. two fields both labeled "Notes").
+  function cleanFields(): AssetTypeField[] {
+    const seen = new Map<string, number>()
+    return fields
+      .filter((f) => f.label.trim())
+      .map((f) => {
+        const count = seen.get(f.key) ?? 0
+        seen.set(f.key, count + 1)
+        return count === 0 ? f : { ...f, key: `${f.key}${count + 1}` }
+      })
   }
 
   const save = useMutation({
     mutationFn: async () => {
       if (editing) {
-        return symbologiesApi.update(editing.id, { name, color, icon: geometryType === 'Point' ? icon : null, isEquipment: geometryType === 'Point' && isEquipment })
+        return symbologiesApi.update(editing.id, {
+          name,
+          color,
+          icon: geometryType === 'Point' ? icon : null,
+          isEquipment: geometryType === 'Point' && isEquipment,
+          isCable: geometryType === 'LineString' && isCable,
+          fields: cleanFields(),
+        })
       }
-      const created = await symbologiesApi.create({ name, geometryType, color, icon: geometryType === 'Point' ? icon : null, isEquipment: geometryType === 'Point' && isEquipment })
+      const created = await symbologiesApi.create({
+        name,
+        geometryType,
+        color,
+        icon: geometryType === 'Point' ? icon : null,
+        isEquipment: geometryType === 'Point' && isEquipment,
+        isCable: geometryType === 'LineString' && isCable,
+        fields: cleanFields(),
+      })
       if (pendingFile) await symbologiesApi.uploadIcon(created.id, pendingFile)
       return created
     },
@@ -295,6 +351,65 @@ function SymbologyModal({
             onChange={(e) => setIsEquipment(e.target.checked)}
           />
         )}
+
+        {geometryType === 'LineString' && (
+          <Checkbox
+            label="Cable (carries fiber strands)"
+            checked={isCable}
+            onChange={(e) => setIsCable(e.target.checked)}
+          />
+        )}
+
+        <div>
+          <label className="mb-1.5 block text-sm font-semibold text-slate-700">Fields</label>
+          <p className="mb-2 text-xs text-muted">
+            What data does an asset of this type collect? Each field can be required. Field values are entered when a surveyor submits, and can be edited by a manager afterward.
+          </p>
+          <div className="flex flex-col gap-2">
+            {fields.map((f, i) => (
+              <div key={i} className="rounded-lg border border-slate-200 p-2.5">
+                <div className="mb-2 flex items-start gap-2">
+                  <Input
+                    value={f.label}
+                    onChange={(e) => updateField(i, { label: e.target.value })}
+                    placeholder="Field label, e.g. Owner Name"
+                    containerClassName="flex-1"
+                  />
+                  <button type="button" onClick={() => removeField(i)} className="mt-2 shrink-0 rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-danger-600" title="Remove field">
+                    <X size={14} />
+                  </button>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Select
+                    value={f.type}
+                    onChange={(e) => updateField(i, { type: e.target.value as AssetTypeField['type'] })}
+                    options={[
+                      { value: 'text', label: 'Text' },
+                      { value: 'number', label: 'Number' },
+                      { value: 'select', label: 'Select' },
+                      { value: 'boolean', label: 'Yes / No' },
+                      { value: 'date', label: 'Date' },
+                      { value: 'textarea', label: 'Long Text' },
+                    ]}
+                    containerClassName="w-36"
+                  />
+                  <Checkbox label="Required" checked={!!f.required} onChange={(e) => updateField(i, { required: e.target.checked })} />
+                  {f.type === 'select' && (
+                    <Input
+                      value={(f.options ?? []).join(', ')}
+                      onChange={(e) => updateField(i, { options: e.target.value.split(',').map((o) => o.trim()).filter(Boolean) })}
+                      placeholder="Options, comma separated"
+                      containerClassName="min-w-[12rem] flex-1"
+                    />
+                  )}
+                </div>
+              </div>
+            ))}
+            <Button type="button" variant="outline" size="sm" leftIcon={<Plus size={14} />} onClick={addField}>
+              Add Field
+            </Button>
+          </div>
+        </div>
 
         {geometryType === 'Point' && (
           <div>

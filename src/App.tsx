@@ -3,7 +3,6 @@ import { RequireAuth } from './auth/RequireAuth'
 import { RequirePermission } from './auth/RequirePermission'
 import { AppShell } from './components/layout/AppShell'
 import { LoginPage } from './pages/LoginPage'
-import { MapDashboardPage } from './pages/MapDashboardPage'
 import { SubmissionsPage } from './pages/SubmissionsPage'
 import { AlarmsPage } from './pages/AlarmsPage'
 import { CustomersPage } from './pages/CustomersPage'
@@ -27,7 +26,12 @@ export default function App() {
           </RequireAuth>
         }
       >
-        <Route path={ROUTES.dashboard} element={<MapDashboardPage />} />
+        {/* MapDashboardPage is rendered persistently inside AppShell (outside
+            this Outlet) so navigating away doesn't unmount the maplibregl
+            instance and re-fetch every tile. This route entry just needs to
+            exist so the path resolves; AppShell shows/hides the persistent
+            instance itself via isMapRoute. */}
+        <Route path={ROUTES.dashboard} element={null} />
         <Route path={ROUTES.submissions} element={<SubmissionsPage />} />
         <Route
           path={ROUTES.alarms}

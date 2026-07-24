@@ -9,6 +9,7 @@ import { mediaUrl } from '../../theme/branding'
 import { Dropdown, useToast, NotificationBell } from '../ui'
 import { useDemoMode } from '../../lib/demoMode'
 import { useNotifications } from '../../lib/notifications'
+import { MapDashboardPage } from '../../pages/MapDashboardPage'
 import mapifyitMark from '../../assets/mapifyit-mark.png'
 
 const NAV = [
@@ -191,7 +192,16 @@ export function AppShell() {
           </header>
         )}
         <main className={isMapRoute ? 'flex-1 overflow-hidden p-0' : 'flex-1 overflow-y-auto p-6'}>
-          <Outlet />
+          {/* MapDashboardPage is rendered permanently here (not inside the
+              Outlet below) so navigating to other tabs doesn't unmount its
+              maplibregl instance and re-fetch every tile/style/sprite. It's
+              created once and only ever destroyed on a real page refresh;
+              every other route continues to mount/unmount normally through
+              Outlet exactly as before — only the expensive map is special-cased. */}
+          <div className={isMapRoute ? 'h-full w-full' : 'hidden'}>
+            <MapDashboardPage />
+          </div>
+          {!isMapRoute && <Outlet />}
         </main>
       </div>
     </div>

@@ -79,6 +79,10 @@ export interface Symbology {
   iconUrl: string | null
   /** Does this symbology represent real equipment that can be online/offline? Org-defined, Point-only. */
   isEquipment: boolean
+  /** Does this symbology represent a fiber cable that carries strands? Org-defined, LineString-only. */
+  isCable: boolean
+  /** Custom attribute schema for assets of this type. Takes precedence over the project's own templateFields when non-empty. */
+  fields: AssetTypeField[]
   createdAt: string
   updatedAt: string
 }
@@ -96,7 +100,7 @@ export interface NetworkAssetProperties {
   projectId: string
   project: { id: string; name: string } | null
   symbologyId: string | null
-  symbology: { id: string; name: string; key: string; color: string; icon: string | null; iconUrl: string | null; isEquipment: boolean } | null
+  symbology: { id: string; name: string; key: string; color: string; icon: string | null; iconUrl: string | null; isEquipment: boolean; isCable: boolean; fields: AssetTypeField[] } | null
   color: string | null
   icon: string | null
   iconUrl: string | null
@@ -126,4 +130,70 @@ export interface NetworkAssetFeature {
 export interface FeatureCollection {
   type: 'FeatureCollection'
   features: NetworkAssetFeature[]
+}
+
+export type StrandStatus = 'available' | 'reserved' | 'in_service' | 'dark' | 'faulty' | 'under_test' | 'under_repair' | 'retired'
+export type StrandRole = 'feeder' | 'distribution' | 'drop'
+export type PortStatus = 'free' | 'connected'
+
+export interface FiberStrand {
+  id: string
+  networkAssetId: string
+  strandNumber: number
+  tubeNumber: number
+  color: string
+  status: StrandStatus
+  role: StrandRole | null
+  assignedCustomerId: string | null
+  assignedCustomer: { id: string; name: string; email: string | null; phone: string | null } | null
+  notes: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface EquipmentPort {
+  id: string
+  networkAssetId: string
+  portNumber: number
+  status: PortStatus
+  notes: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export type SpliceEndpointType = 'strand' | 'port'
+
+export interface SpliceEndpointRef {
+  type: SpliceEndpointType
+  strandId?: string
+  side?: 'A' | 'Z'
+  portId?: string
+}
+
+export interface FiberSplice {
+  id: string
+  projectId: string
+  spliceAssetId: string | null
+  endAType: SpliceEndpointType
+  endAStrandId: string | null
+  endAStrandSide: 'A' | 'Z' | null
+  endAPortId: string | null
+  endAStrand?: FiberStrand | null
+  endAPort?: EquipmentPort | null
+  endBType: SpliceEndpointType
+  endBStrandId: string | null
+  endBStrandSide: 'A' | 'Z' | null
+  endBPortId: string | null
+  endBStrand?: FiberStrand | null
+  endBPort?: EquipmentPort | null
+  notes: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface FiberTraceResult {
+  strands: FiberStrand[]
+  ports: EquipmentPort[]
+  cableAssetIds: string[]
+  customers: { id: string; name: string; email: string | null; phone: string | null }[]
 }

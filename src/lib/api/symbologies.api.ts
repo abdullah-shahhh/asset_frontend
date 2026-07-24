@@ -1,5 +1,5 @@
 import { api } from './client'
-import type { GeometryType, Symbology } from './types'
+import type { AssetTypeField, GeometryType, Symbology } from './types'
 
 export interface SymbologyPayload {
   name: string
@@ -7,6 +7,8 @@ export interface SymbologyPayload {
   color: string
   icon?: string | null
   isEquipment?: boolean
+  isCable?: boolean
+  fields?: AssetTypeField[]
 }
 
 const BASE = '/v1/org/symbologies'
@@ -14,7 +16,7 @@ const BASE = '/v1/org/symbologies'
 export const symbologiesApi = {
   list: () => api.get<Symbology[]>(BASE),
   create: (payload: SymbologyPayload) => api.post<Symbology>(BASE, payload),
-  update: (id: string, payload: Partial<Pick<SymbologyPayload, 'name' | 'color' | 'icon' | 'isEquipment'>>) => api.patch<Symbology>(`${BASE}/${id}`, payload),
+  update: (id: string, payload: Partial<Pick<SymbologyPayload, 'name' | 'color' | 'icon' | 'isEquipment' | 'isCable' | 'fields'>>) => api.patch<Symbology>(`${BASE}/${id}`, payload),
   remove: (id: string) => api.del<null>(`${BASE}/${id}`),
   async uploadIcon(id: string, file: File) {
     const form = new FormData()
