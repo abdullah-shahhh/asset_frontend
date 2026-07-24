@@ -905,7 +905,6 @@ export function MapDashboardPage() {
     // construction, before this listener existed to catch its 'zoom' event.
     setZoom(map.getZoom())
     mapRef.current = map
-    ;(window as unknown as { __debugMap?: maplibregl.Map }).__debugMap = map
     map.once('load', () => {
       styleReadyRef.current = true
     })
