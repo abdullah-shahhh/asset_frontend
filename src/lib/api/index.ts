@@ -15,4 +15,6 @@ export { connectionsApi, type NetworkConnectionFeature, type NetworkConnectionFe
 export { customersApi, type Customer, type CustomerAsset, type CustomerPayload } from './customers.api'
 export { ticketsApi, type Ticket, type TicketPayload, type TicketStatus, type TicketPriority } from './tickets.api'
 export { strandsApi, portsApi, fiberSplicesApi } from './fiber.api'
+export { shareLinksApi, type ShareLink, type ShareLinkPayload } from './shareLinks.api'
+export { publicShareApi, type SharedProjectInfo } from './publicShare.api'
 export * from './types'

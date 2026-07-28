@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { FolderKanban, LayoutDashboard, MapPin, Palette, Plus, Spline, Square, Users } from 'lucide-react'
+import { FolderKanban, LayoutDashboard, MapPin, Palette, Plus, Share2, Spline, Square, Users } from 'lucide-react'
 import { fieldTeamApi, projectsApi, symbologiesApi, ApiError, type GeometryType, type Project, type Surveyor, type Symbology } from '../lib/api'
 import { Badge, Button, Card, Checkbox, DataState, EmptyState, Input, Modal, PageHeader, Table, TBody, TD, TH, THead, TR, Textarea, useToast } from '../components/ui'
+import { ShareModal } from '../components/ShareModal'
 import { useAuth } from '../auth/AuthContext'
 import { projectDashboardPath } from '../lib/routes'
 
@@ -15,6 +16,7 @@ export function ProjectsPage() {
   const [modalOpen, setModalOpen] = useState(false)
   const [assigningProject, setAssigningProject] = useState<Project | null>(null)
   const [assigningSurveyors, setAssigningSurveyors] = useState<Project | null>(null)
+  const [sharingProject, setSharingProject] = useState<Project | null>(null)
   const { hasPermission } = useAuth()
   const canCreate = hasPermission('projects.create')
   const canManageSymbologies = hasPermission('symbologies.manage')
@@ -70,9 +72,15 @@ export function ProjectsPage() {
             <TBody>
               {projects.map((p) => (
                 <TR key={p.id}>
-                  <TD>
-                    <div className="font-semibold text-ink">{p.name}</div>
-                    {p.description && <div className="text-xs text-muted">{p.description}</div>}
+                  <TD className="max-w-[260px]">
+                    <div className="truncate font-semibold text-ink" title={p.name}>
+                      {p.name}
+                    </div>
+                    {p.description && (
+                      <div className="truncate text-xs text-muted" title={p.description}>
+                        {p.description}
+                      </div>
+                    )}
                   </TD>
                   <TD>
                     <Badge tone="neutral">{p.surveyType || 'Custom'}</Badge>
@@ -85,18 +93,21 @@ export function ProjectsPage() {
                   </TD>
                   <TD className="text-muted">{new Date(p.createdAt).toLocaleDateString()}</TD>
                   <TD className="text-right">
-                    <div className="flex justify-end gap-2">
-                      <Button size="sm" variant="outline" leftIcon={<LayoutDashboard size={14} />} onClick={() => navigate(projectDashboardPath(p.id))}>
-                        Dashboard
+                    <div className="flex justify-end gap-1.5">
+                      <Button size="icon" variant="outline" title="Dashboard" onClick={() => navigate(projectDashboardPath(p.id))}>
+                        <LayoutDashboard size={15} />
+                      </Button>
+                      <Button size="icon" variant="outline" title="Share" onClick={() => setSharingProject(p)}>
+                        <Share2 size={15} />
                       </Button>
                       {canManageSurveyors && (
-                        <Button size="sm" variant="outline" leftIcon={<Users size={14} />} onClick={() => setAssigningSurveyors(p)}>
-                          Surveyors
+                        <Button size="icon" variant="outline" title="Surveyors" onClick={() => setAssigningSurveyors(p)}>
+                          <Users size={15} />
                         </Button>
                       )}
                       {canManageSymbologies && (
-                        <Button size="sm" variant="outline" leftIcon={<Palette size={14} />} onClick={() => setAssigningProject(p)}>
-                          Symbologies
+                        <Button size="icon" variant="outline" title="Symbologies" onClick={() => setAssigningProject(p)}>
+                          <Palette size={15} />
                         </Button>
                       )}
                     </div>
@@ -118,6 +129,7 @@ export function ProjectsPage() {
 
       <AssignSymbologiesModal project={assigningProject} onClose={() => setAssigningProject(null)} pushToast={push} />
       <AssignSurveyorsModal project={assigningSurveyors} onClose={() => setAssigningSurveyors(null)} pushToast={push} />
+      {sharingProject && <ShareModal open onClose={() => setSharingProject(null)} projectId={sharingProject.id} projectName={sharingProject.name} />}
     </div>
   )
 }

@@ -3,6 +3,7 @@ import { RequireAuth } from './auth/RequireAuth'
 import { RequirePermission } from './auth/RequirePermission'
 import { AppShell } from './components/layout/AppShell'
 import { LoginPage } from './pages/LoginPage'
+import { SharedMapPage } from './pages/SharedMapPage'
 import { SubmissionsPage } from './pages/SubmissionsPage'
 import { AlarmsPage } from './pages/AlarmsPage'
 import { CustomersPage } from './pages/CustomersPage'
@@ -20,6 +21,7 @@ export default function App() {
   return (
     <Routes>
       <Route path={ROUTES.login} element={<LoginPage />} />
+      <Route path="/share/:token" element={<SharedMapPage />} />
       <Route
         element={
           <RequireAuth>
@@ -33,7 +35,14 @@ export default function App() {
             exist so the path resolves; AppShell shows/hides the persistent
             instance itself via isMapRoute. */}
         <Route path={ROUTES.dashboard} element={null} />
-        <Route path={ROUTES.submissions} element={<SubmissionsPage />} />
+        <Route
+          path={ROUTES.submissions}
+          element={
+            <RequirePermission permission="assets.approve">
+              <SubmissionsPage />
+            </RequirePermission>
+          }
+        />
         <Route
           path={ROUTES.alarms}
           element={
@@ -42,8 +51,22 @@ export default function App() {
             </RequirePermission>
           }
         />
-        <Route path={ROUTES.projects} element={<ProjectsPage />} />
-        <Route path={ROUTES.projectDashboard} element={<ProjectDashboardPage />} />
+        <Route
+          path={ROUTES.projects}
+          element={
+            <RequirePermission permission="projects.view">
+              <ProjectsPage />
+            </RequirePermission>
+          }
+        />
+        <Route
+          path={ROUTES.projectDashboard}
+          element={
+            <RequirePermission permission="projects.view">
+              <ProjectDashboardPage />
+            </RequirePermission>
+          }
+        />
         <Route
           path={ROUTES.customers}
           element={

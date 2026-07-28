@@ -20,7 +20,8 @@ import {
   HardHat,
 } from 'lucide-react'
 import { projectsApi, networkAssetsApi, connectionsApi } from '../lib/api'
-import { Badge, Card, DataState, EmptyState, PageHeader, StatCard, Table, TBody, TD, TH, THead, Tabs, TR } from '../components/ui'
+import { Badge, Button, Card, DataState, EmptyState, PageHeader, StatCard, Table, TBody, TD, TH, THead, Tabs, TR } from '../components/ui'
+import { ShareModal } from '../components/ShareModal'
 
 const FALLBACK_COLOR = '#64748b'
 
@@ -28,6 +29,7 @@ export function ProjectDashboardPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const [tab, setTab] = useState<'overview' | 'assets' | 'connections' | 'symbology' | 'surveyors'>('overview')
+  const [shareOpen, setShareOpen] = useState(false)
 
   const projectQuery = useQuery({ queryKey: ['projects', id], queryFn: () => projectsApi.get(id!), enabled: !!id })
   const statsQuery = useQuery({ queryKey: ['projects', id, 'stats'], queryFn: () => projectsApi.getStats(id!), enabled: !!id })
@@ -60,7 +62,17 @@ export function ProjectDashboardPage() {
         Back to Projects
       </button>
 
-      <PageHeader title={projectQuery.data?.name ?? 'Project Dashboard'} subtitle="Everything happening in this project — live, not a snapshot." />
+      <PageHeader
+        title={projectQuery.data?.name ?? 'Project Dashboard'}
+        subtitle="Everything happening in this project — live, not a snapshot."
+        action={
+          <Button variant="outline" leftIcon={<Share2 size={14} />} onClick={() => setShareOpen(true)}>
+            Share
+          </Button>
+        }
+      />
+
+      {id && <ShareModal open={shareOpen} onClose={() => setShareOpen(false)} projectId={id} projectName={projectQuery.data?.name ?? 'this project'} />}
 
       <Tabs
         tabs={[

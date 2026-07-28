@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { useLocation, useSearchParams } from 'react-router-dom'
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import maplibregl, { Map as MapLibreMap } from 'maplibre-gl'
@@ -378,6 +378,7 @@ export function MapDashboardPage() {
   const canApprove = hasPermission('assets.approve')
   const canEditGeometry = hasPermission('assets.update')
   const canDelete = hasPermission('assets.delete')
+  const canCreateAssets = hasPermission('assets.create')
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
 
   // Which project's symbologies the draw tools currently offer.
@@ -397,6 +398,7 @@ export function MapDashboardPage() {
   // re-fire. Gated on pathname so a stray `project`/`asset` query param on
   // some other page can't be picked up while this component sits hidden.
   const location = useLocation()
+  const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   useEffect(() => {
     if (location.pathname !== ROUTES.dashboard) return
@@ -476,6 +478,33 @@ export function MapDashboardPage() {
     enabled: !!activeProjectId,
   })
   const projectsQuery = useQuery({ queryKey: ['projects', 'all'], queryFn: () => projectsApi.list({ limit: 100 }) })
+
+  // First-load landing experience: an untouched map with nothing selected is
+  // a confusing blank void, so restore whatever project this user last had
+  // open (or fall back to their most recent project) instead of making them
+  // pick one every single session. Runs once — after that, an explicit
+  // "Select project…" choice is respected, not silently overridden.
+  const hasAutoSelectedProjectRef = useRef(false)
+  useEffect(() => {
+    if (hasAutoSelectedProjectRef.current) return
+    if (activeProjectId) {
+      hasAutoSelectedProjectRef.current = true
+      return
+    }
+    if (searchParams.get('project')) return // the deep-link effect above owns this case
+    const items = projectsQuery.data?.items
+    if (!items) return // still loading — wait for real data before deciding
+    hasAutoSelectedProjectRef.current = true
+    const savedId = localStorage.getItem('uamp:lastProjectId')
+    const restored = savedId && items.find((p) => p.id === savedId)
+    const fallback = [...items].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0]
+    const next = restored ?? fallback
+    if (next) setActiveProjectId(next.id)
+  }, [projectsQuery.data, activeProjectId, searchParams])
+
+  useEffect(() => {
+    if (activeProjectId) localStorage.setItem('uamp:lastProjectId', activeProjectId)
+  }, [activeProjectId])
   const projectSymbologiesQuery = useQuery({
     queryKey: ['projects', activeProjectId, 'symbologies'],
     queryFn: () => projectsApi.getSymbologies(activeProjectId),
@@ -1758,9 +1787,13 @@ export function MapDashboardPage() {
             icon={<Hand size={15} />}
             label="Pan"
           />
-          <ToolbarButton active={tool === 'point'} disabled={!pointSymbologies.length || !!editingFeature} onClick={() => toggleTool('point')} icon={<MapPin size={15} />} label={tool === 'point' ? 'Cancel' : 'Point'} />
-          <ToolbarButton active={tool === 'line'} disabled={!lineSymbologies.length || !!editingFeature} onClick={() => toggleTool('line')} icon={<Spline size={15} />} label={tool === 'line' ? 'Cancel' : 'Line'} />
-          <ToolbarButton active={tool === 'polygon'} disabled={!polygonSymbologies.length || !!editingFeature} onClick={() => toggleTool('polygon')} icon={<Square size={15} />} label={tool === 'polygon' ? 'Cancel' : 'Polygon'} />
+          {canCreateAssets && (
+            <>
+              <ToolbarButton active={tool === 'point'} disabled={!pointSymbologies.length || !!editingFeature} onClick={() => toggleTool('point')} icon={<MapPin size={15} />} label={tool === 'point' ? 'Cancel' : 'Point'} />
+              <ToolbarButton active={tool === 'line'} disabled={!lineSymbologies.length || !!editingFeature} onClick={() => toggleTool('line')} icon={<Spline size={15} />} label={tool === 'line' ? 'Cancel' : 'Line'} />
+              <ToolbarButton active={tool === 'polygon'} disabled={!polygonSymbologies.length || !!editingFeature} onClick={() => toggleTool('polygon')} icon={<Square size={15} />} label={tool === 'polygon' ? 'Cancel' : 'Polygon'} />
+            </>
+          )}
           {canEditGeometry && (
             <ToolbarButton active={tool === 'connect'} disabled={featureCount < 2 || !!editingFeature} onClick={() => toggleTool('connect')} icon={<Link size={15} />} label={tool === 'connect' ? 'Cancel' : 'Connect'} />
           )}
@@ -1771,7 +1804,7 @@ export function MapDashboardPage() {
           <ToolbarButton active={tool === 'measure-distance'} disabled={!!editingFeature} onClick={() => toggleTool('measure-distance')} icon={<Ruler size={15} />} label={tool === 'measure-distance' ? 'Cancel' : 'Distance'} />
           <ToolbarButton active={tool === 'measure-area'} disabled={!!editingFeature} onClick={() => toggleTool('measure-area')} icon={<Pentagon size={15} />} label={tool === 'measure-area' ? 'Cancel' : 'Area'} />
           <div className="mx-1.5 h-5 w-px bg-white/10" />
-          <ToolbarButton disabled={!!editingFeature} onClick={() => setImportOpen(true)} icon={<Upload size={15} />} label="Import" />
+          {canCreateAssets && <ToolbarButton disabled={!!editingFeature} onClick={() => setImportOpen(true)} icon={<Upload size={15} />} label="Import" />}
           <ToolbarButton disabled={!!editingFeature} onClick={() => setExportOpen(true)} icon={<Download size={15} />} label="Export" />
           <div className="mx-1.5 h-5 w-px bg-white/10" />
           <div className="relative flex items-center">
@@ -1982,7 +2015,22 @@ export function MapDashboardPage() {
             </div>
           )}
 
-          {!activeProjectId && tool === null && !selectedFeature && !editingFeature && (
+          {!activeProjectId && tool === null && !selectedFeature && !editingFeature && projectsQuery.data && projectsQuery.data.items.length === 0 && (
+            <div className="absolute inset-0 z-20 flex items-center justify-center">
+              <Card className="flex max-w-sm flex-col items-center gap-3 p-8 text-center shadow-xl">
+                <span className="grid h-12 w-12 place-items-center rounded-full bg-primary-50 text-primary-600">
+                  <FolderKanban size={22} />
+                </span>
+                <div>
+                  <h2 className="text-base font-bold text-ink">No projects yet</h2>
+                  <p className="mt-1 text-sm text-muted">Create a project to start drawing assets on the map — every asset belongs to one.</p>
+                </div>
+                <Button onClick={() => navigate(ROUTES.projects)}>Create a project</Button>
+              </Card>
+            </div>
+          )}
+
+          {!activeProjectId && tool === null && !selectedFeature && !editingFeature && projectsQuery.data && projectsQuery.data.items.length > 0 && (
             <div className="absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded-lg bg-ink/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg">Select a project in the toolbar to start drawing</div>
           )}
 
