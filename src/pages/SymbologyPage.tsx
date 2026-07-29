@@ -182,6 +182,8 @@ function SymbologyModal({
   const [isEquipment, setIsEquipment] = useState(editing?.isEquipment ?? false)
   const [isCable, setIsCable] = useState(editing?.isCable ?? false)
   const [isRfSite, setIsRfSite] = useState(editing?.isRfSite ?? false)
+  const [lineWidth, setLineWidth] = useState(editing?.lineWidth ?? 5)
+  const [dashArray, setDashArray] = useState<number[]>(editing?.dashArray ?? [])
   const [fields, setFields] = useState<AssetTypeField[]>(editing?.fields ?? [])
   // A file picked before the symbology exists yet (creation flow) — held
   // locally and uploaded right after the create call succeeds.
@@ -200,6 +202,8 @@ function SymbologyModal({
     setIsEquipment(editing?.isEquipment ?? false)
     setIsCable(editing?.isCable ?? false)
     setIsRfSite(editing?.isRfSite ?? false)
+    setLineWidth(editing?.lineWidth ?? 5)
+    setDashArray(editing?.dashArray ?? [])
     setFields(editing?.fields ?? [])
     setPendingFile(null)
     setPendingPreview(null)
@@ -247,6 +251,8 @@ function SymbologyModal({
           isEquipment: geometryType === 'Point' && isEquipment,
           isCable: geometryType === 'LineString' && isCable,
           isRfSite: geometryType === 'Point' && isRfSite,
+          lineWidth,
+          dashArray: geometryType === 'LineString' ? dashArray : [],
           fields: cleanFields(),
         })
       }
@@ -258,6 +264,8 @@ function SymbologyModal({
         isEquipment: geometryType === 'Point' && isEquipment,
         isCable: geometryType === 'LineString' && isCable,
         isRfSite: geometryType === 'Point' && isRfSite,
+        lineWidth,
+        dashArray: geometryType === 'LineString' ? dashArray : [],
         fields: cleanFields(),
       })
       if (pendingFile) await symbologiesApi.uploadIcon(created.id, pendingFile)
@@ -375,6 +383,35 @@ function SymbologyModal({
             checked={isCable}
             onChange={(e) => setIsCable(e.target.checked)}
           />
+        )}
+
+        {geometryType === 'LineString' && (
+          <div>
+            <label className="mb-1.5 block text-sm font-semibold text-slate-700">Line Style</label>
+            <div className="flex items-center gap-3">
+              <Input
+                type="number"
+                min={0.5}
+                max={20}
+                step={0.5}
+                value={lineWidth}
+                onChange={(e) => setLineWidth(Number(e.target.value) || 2)}
+                containerClassName="w-24"
+                label="Width (px)"
+              />
+              <Select
+                label="Pattern"
+                value={JSON.stringify(dashArray)}
+                onChange={(e) => setDashArray(JSON.parse(e.target.value))}
+                options={[
+                  { value: '[]', label: 'Solid' },
+                  { value: '[4,2]', label: 'Dashed' },
+                  { value: '[1,2]', label: 'Dotted' },
+                ]}
+                containerClassName="flex-1"
+              />
+            </div>
+          </div>
         )}
 
         <div>

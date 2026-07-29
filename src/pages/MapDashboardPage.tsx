@@ -45,6 +45,10 @@ import {
   ChevronDown,
   ChevronRight,
   Antenna,
+  Printer,
+  Magnet,
+  Redo2,
+  Grid3x3,
 } from 'lucide-react'
 import {
   networkAssetsApi,
@@ -71,8 +75,15 @@ import {
   type FiberTraceResult,
   type SpliceEndpointRef,
   type Customer,
+  type FeatureCollection,
+  type Symbology,
 } from '../lib/api'
 import { TILES_BASE, mapifyitTransformRequest } from '../lib/maps'
+import { captureMapImage, composeExportCanvas, exportCanvasToPDF, exportCanvasToPNG, type PrintLegendEntry } from '../lib/mapExport'
+import { findSnapTarget, snapToGrid } from '../lib/snapping'
+import { useHistoryStack } from '../lib/useHistoryStack'
+import { parseShapefile, parseKML, parseDXF, type DxfGeoreference } from '../lib/importParsers'
+import { bufferGeometry, offsetLine, clipPolygon, rotateGeometry, scaleGeometry, mirrorGeometry, type LengthUnit, type ClipMode, type MirrorAxis } from '../lib/geometryOps'
 import { ROUTES } from '../lib/routes'
 import { Badge, Button, Card, Checkbox, ConfirmDialog, Dropdown, Input, Modal, NotificationBell, Select, Spinner, Textarea, useToast } from '../components/ui'
 import { useAuth } from '../auth/AuthContext'
@@ -80,6 +91,12 @@ import { resolveSymbologyIcon } from '../lib/symbologyIcons'
 import { mediaUrl } from '../theme/branding'
 
 const FALLBACK_COLOR = '#64748b'
+
+// Layers searched for edge/vertex snapping while drawing or editing —
+// deliberately excludes assets-points-capture (hidden, capture-only) and the
+// point markers themselves (those already snap exactly via their own onclick
+// handler, see the point-markers effect below).
+const SNAP_LAYER_IDS = ['assets-lines-solid', 'assets-lines-dashed', 'assets-lines-dotted', 'assets-polygons']
 
 function hexToRgba(hex: string, alpha: number): string {
   const clean = hex.replace('#', '')
@@ -291,6 +308,15 @@ const FAULT_REASONS = [
 type Tool = 'point' | 'line' | 'polygon' | 'connect' | 'splice' | 'measure-distance' | 'measure-area' | null
 type BasemapStyle = 'dark' | 'bright'
 
+interface ToolCommand {
+  id: string
+  label: string
+  keywords?: string
+  icon: ReactNode
+  disabled?: boolean
+  run: () => void
+}
+
 const METERS_PER_MILE = 1609.344
 const SQMETERS_PER_ACRE = 4046.8564224
 
@@ -374,7 +400,7 @@ export function MapDashboardPage() {
   }
   const queryClient = useQueryClient()
   const { push } = useToast()
-  const { user, logout, hasPermission } = useAuth()
+  const { user, organization, logout, hasPermission } = useAuth()
   const canApprove = hasPermission('assets.approve')
   const canEditGeometry = hasPermission('assets.update')
   const canDelete = hasPermission('assets.delete')
@@ -449,9 +475,52 @@ export function MapDashboardPage() {
   // Geometry editing (drag vertices / add / remove points on an existing asset).
   const [editingFeature, setEditingFeature] = useState<NetworkAssetFeature | null>(null)
   const [editVertices, setEditVertices] = useState<[number, number][]>([])
+  // Session-only undo/redo — one stack for an in-progress draw, one for an
+  // in-progress geometry edit. Both are cleared in resetDrawing() and
+  // cancelEditGeometry() (defensively, in both, since those are the two
+  // different lifecycle exit points for a draw session vs. an edit session
+  // respectively) so a stray Ctrl+Z can never reach into an already-saved
+  // previous edit.
+  const linePointsHistory = useHistoryStack(linePoints, setLinePoints)
+  const editVerticesHistory = useHistoryStack(editVertices, setEditVertices)
+
+  // Buffer/offset/clip — operate on an already-selected existing feature,
+  // feeding the result back into the existing draftGeometry ->
+  // symbology-picker -> submit pipeline rather than a separate save path.
+  const [geometryOpsOpen, setGeometryOpsOpen] = useState<'buffer' | 'offset' | 'rotate' | 'scale' | null>(null)
+  const [geometryOpsDistance, setGeometryOpsDistance] = useState(10)
+  const [geometryOpsUnit, setGeometryOpsUnit] = useState<LengthUnit>('feet')
+  const [geometryOpsAngle, setGeometryOpsAngle] = useState(90)
+  const [geometryOpsFactor, setGeometryOpsFactor] = useState(1.5)
+  // Clip needs a second polygon: the user draws it with the normal polygon
+  // tool right after clicking Clip, so these hold the original subject
+  // (which toggleTool('polygon')'s resetDrawing() would otherwise clear via
+  // setSelectedFeature) until that boundary draw finishes.
+  const [clipSubject, setClipSubject] = useState<GeoJsonGeometry | null>(null)
+  const [clipMode, setClipMode] = useState<ClipMode | null>(null)
+
+  // Snapping is a standing preference, not per-shape draft state — it must
+  // survive resetDrawing()/tool switches, unlike everything else in this
+  // block. Grid step of 0 means grid snap is off (feature/vertex snap can
+  // still apply independently via snapEnabled).
+  const [snapEnabled, setSnapEnabled] = useState(false)
+  const [gridSnapMeters, setGridSnapMeters] = useState(0)
+  // Mirrored into refs (like toolRef/draftGeometryRef further below) so
+  // resolveSnappedCoordinate reads the current value from handlers bound
+  // once per marker/drag-session, not a stale closure value.
+  const snapEnabledRef = useRef(snapEnabled)
+  useEffect(() => {
+    snapEnabledRef.current = snapEnabled
+  }, [snapEnabled])
+  const gridSnapMetersRef = useRef(gridSnapMeters)
+  useEffect(() => {
+    gridSnapMetersRef.current = gridSnapMeters
+  }, [gridSnapMeters])
 
   const [importOpen, setImportOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
+  const [printOpen, setPrintOpen] = useState(false)
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false)
   const [coordinateEntryOpen, setCoordinateEntryOpen] = useState(false)
 
   // Measurement tool (distance / area) — deliberately kept independent of the
@@ -931,6 +1000,10 @@ export function MapDashboardPage() {
   function cancelEditGeometry() {
     setEditingFeature(null)
     setEditVertices([])
+    editVerticesHistory.clear()
+    linePointsHistory.clear()
+    setClipSubject(null)
+    setClipMode(null)
   }
 
   function resetDrawing() {
@@ -945,20 +1018,51 @@ export function MapDashboardPage() {
     setMeasurePoints([])
     setConnectFromId(null)
     setSpliceFromAsset(null)
+    setClipSubject(null)
+    setClipMode(null)
+    linePointsHistory.clear()
+    editVerticesHistory.clear()
   }
 
   function finishShape() {
     if (tool === 'line' && linePoints.length >= 2) {
       setDraftGeometry({ type: 'LineString', coordinates: linePoints })
     } else if (tool === 'polygon' && linePoints.length >= 3) {
-      setDraftGeometry({ type: 'Polygon', coordinates: [[...linePoints, linePoints[0]]] })
+      const boundary: GeoJsonGeometry = { type: 'Polygon', coordinates: [[...linePoints, linePoints[0]]] }
+      // If this polygon was drawn as a clip boundary (see startClip), clip
+      // the stashed subject against it instead of offering the boundary
+      // itself up as a new asset.
+      if (clipMode && clipSubject) {
+        try {
+          const result = clipPolygon(clipSubject, boundary, clipMode)
+          setDraftGeometry(result.geometry)
+          if (result.warning) push(result.warning, 'info')
+        } catch (err) {
+          push(err instanceof Error ? err.message : 'Clip failed', 'error')
+          setDraftGeometry(null)
+        }
+        setClipSubject(null)
+        setClipMode(null)
+      } else {
+        setDraftGeometry(boundary)
+      }
     }
-  }
-  function undoLinePoint() {
-    setLinePoints((pts) => pts.slice(0, -1))
   }
   function undoMeasurePoint() {
     setMeasurePoints((pts) => pts.slice(0, -1))
+  }
+  /** Apply the standing snap preference to a just-clicked/dropped
+   * coordinate: grid snap takes priority when active, else edge/vertex snap
+   * when enabled, else the raw coordinate. Reads snap settings via refs so
+   * it stays correct both from handlers recreated every render (the raw map
+   * click effect) and ones bound once (marker drag). */
+  function resolveSnappedCoordinate(rawLngLat: [number, number], screenPoint?: { x: number; y: number }): [number, number] {
+    if (gridSnapMetersRef.current > 0) return snapToGrid(rawLngLat, gridSnapMetersRef.current)
+    if (snapEnabledRef.current && screenPoint && mapRef.current) {
+      const target = findSnapTarget(mapRef.current, screenPoint, SNAP_LAYER_IDS)
+      if (target) return target.lngLat
+    }
+    return rawLngLat
   }
   function toggleTool(next: Exclude<Tool, null>) {
     const wasActive = tool === next
@@ -966,6 +1070,57 @@ export function MapDashboardPage() {
     setSelectedFeature(null)
     setSelectedConnection(null)
     if (!wasActive) setTool(next)
+  }
+
+  /** Buffer/offset a selected existing feature, feeding the result into the
+   * same draftGeometry -> symbology-picker -> submit pipeline a freshly
+   * drawn shape uses — the cheapest way to turn the result into a new asset
+   * without a separate save path. */
+  function applyGeometryOp(kind: 'buffer' | 'offset' | 'rotate' | 'scale') {
+    if (!selectedFeature) return
+    try {
+      const result =
+        kind === 'buffer'
+          ? bufferGeometry(selectedFeature.geometry, geometryOpsDistance, geometryOpsUnit)
+          : kind === 'offset'
+            ? offsetLine(selectedFeature.geometry, geometryOpsDistance, geometryOpsUnit)
+            : kind === 'rotate'
+              ? rotateGeometry(selectedFeature.geometry, geometryOpsAngle)
+              : scaleGeometry(selectedFeature.geometry, geometryOpsFactor)
+      setDraftGeometry(result.geometry)
+      setSelectedFeature(null)
+      setGeometryOpsOpen(null)
+      if (result.warning) push(result.warning, 'info')
+    } catch (err) {
+      push(err instanceof Error ? err.message : `${kind} failed`, 'error')
+    }
+  }
+
+  /** Mirror is a single click (flip across an axis through the shape's own
+   * centroid) — unlike Clip it needs no second shape, so it skips the
+   * distance/angle sub-form entirely. */
+  function applyMirror(axis: MirrorAxis) {
+    if (!selectedFeature) return
+    try {
+      const result = mirrorGeometry(selectedFeature.geometry, axis)
+      setDraftGeometry(result.geometry)
+      setSelectedFeature(null)
+      if (result.warning) push(result.warning, 'info')
+    } catch (err) {
+      push(err instanceof Error ? err.message : 'Mirror failed', 'error')
+    }
+  }
+
+  /** Clip needs a second polygon — stash the subject, then let the user draw
+   * the boundary with the normal polygon tool. The watcher effect below
+   * picks up once that boundary draw finishes (draftGeometry becomes set). */
+  function startClip(mode: ClipMode) {
+    if (!selectedFeature || selectedFeature.geometry.type !== 'Polygon') return
+    const subject = selectedFeature.geometry
+    toggleTool('polygon')
+    setClipSubject(subject)
+    setClipMode(mode)
+    push('Draw the clip boundary polygon, then click Finish', 'info')
   }
 
   function switchBasemap(style: BasemapStyle) {
@@ -995,7 +1150,9 @@ export function MapDashboardPage() {
       ],
       fitBoundsOptions: { padding: 20 },
       attributionControl: false,
-      canvasContextAttributes: { antialias: true },
+      // preserveDrawingBuffer is required for canvas.toDataURL()/toBlob() to
+      // read back a non-blank image — used by the Print export (mapExport.ts).
+      canvasContextAttributes: { antialias: true, preserveDrawingBuffer: true },
       transformRequest: (url) => mapifyitTransformRequest(url),
     })
     map.addControl(new maplibregl.NavigationControl({ showCompass: true, visualizePitch: false }), 'top-right')
@@ -1049,12 +1206,41 @@ export function MapDashboardPage() {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') exitToNormalMode()
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        setCommandPaletteOpen((v) => !v)
+        return
+      }
+      if (e.key === 'Escape') {
+        if (commandPaletteOpen) {
+          setCommandPaletteOpen(false)
+          return
+        }
+        exitToNormalMode()
+        return
+      }
+      const isUndo = (e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z'
+      const isRedo = (e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'z'
+      if (!isUndo && !isRedo) return
+      // Don't hijack Ctrl+Z away from a focused text field (Notes, attribute
+      // inputs, coordinate entry) — that's the browser's own text undo, not
+      // the map's geometry history.
+      const target = e.target as HTMLElement | null
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return
+      if (editingFeature) {
+        e.preventDefault()
+        if (isRedo) editVerticesHistory.redo()
+        else editVerticesHistory.undo()
+      } else if (tool === 'line' || tool === 'polygon') {
+        e.preventDefault()
+        if (isRedo) linePointsHistory.redo()
+        else linePointsHistory.undo()
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tool, draftGeometry, selectedFeature, editingFeature])
+  }, [tool, draftGeometry, selectedFeature, editingFeature, commandPaletteOpen])
 
   // Map click behaviour depends on the active tool.
   useEffect(() => {
@@ -1066,9 +1252,12 @@ export function MapDashboardPage() {
     function onClick(e: maplibregl.MapMouseEvent) {
       if (editingFeature) return
       if (tool === 'point' && !draftGeometry) {
-        setDraftGeometry({ type: 'Point', coordinates: [e.lngLat.lng, e.lngLat.lat] })
+        const coord = resolveSnappedCoordinate([e.lngLat.lng, e.lngLat.lat], e.point)
+        setDraftGeometry({ type: 'Point', coordinates: coord })
       } else if ((tool === 'line' || tool === 'polygon') && !draftGeometry) {
-        setLinePoints((pts) => [...pts, [e.lngLat.lng, e.lngLat.lat]])
+        const coord = resolveSnappedCoordinate([e.lngLat.lng, e.lngLat.lat], e.point)
+        linePointsHistory.record()
+        setLinePoints((pts) => [...pts, coord])
       } else if (tool === 'measure-distance' || tool === 'measure-area') {
         setMeasurePoints((pts) => [...pts, [e.lngLat.lng, e.lngLat.lat]])
       }
@@ -1283,15 +1472,27 @@ export function MapDashboardPage() {
       ...rawFc,
       features: rawFc.features
         .filter((f) => !hiddenSymbologyIds.has(f.properties.symbologyId ?? ''))
-        // A simulated fault overrides the symbology color with red and marks
-        // the feature so the line-width expression below can thicken it.
-        .map((f) => (f.properties.attributes?.faultActive ? { ...f, properties: { ...f.properties, color: '#ef4444', faulted: true } } : f)),
+        .map((f) => {
+          // A simulated fault overrides the symbology color with red and
+          // marks the feature so the line-width expression below can
+          // thicken it.
+          const faultPatch = f.properties.attributes?.faultActive ? { color: '#ef4444', faulted: true } : {}
+          // MapLibre's line-dasharray isn't a per-feature data-driven paint
+          // property, so cables are split across a small fixed set of
+          // dash-pattern layers (below) instead — this key drives that filter.
+          const dash: number[] = f.properties.dashArray ?? []
+          const dashPatternKey = !dash.length ? 'solid' : dash[0] <= 1.5 ? 'dotted' : 'dashed'
+          return { ...f, properties: { ...f.properties, dashPatternKey, ...faultPatch } }
+        }),
     } as GeoJSON.FeatureCollection
     assetsFcRef.current = fc
 
     const symbologyColor = ['coalesce', ['get', 'color'], FALLBACK_COLOR] as unknown as maplibregl.ExpressionSpecification
     const statusOpacity = ['match', ['get', 'status'], 'rejected', 0.3, 'pending', 0.65, 1] as unknown as maplibregl.ExpressionSpecification
-    const lineWidth = ['case', ['==', ['get', 'faulted'], true], 7, 5] as unknown as maplibregl.ExpressionSpecification
+    // Per-symbology line width, thickened by 2px when a fault is simulated.
+    const symbologyLineWidth = ['coalesce', ['get', 'lineWidth'], 5] as unknown as maplibregl.ExpressionSpecification
+    const lineWidth = ['case', ['==', ['get', 'faulted'], true], ['+', symbologyLineWidth, 2], symbologyLineWidth] as unknown as maplibregl.ExpressionSpecification
+    const haloWidth = ['+', symbologyLineWidth, 6] as unknown as maplibregl.ExpressionSpecification
 
     const applyData = () => {
       const source = map.getSource('assets') as maplibregl.GeoJSONSource | undefined
@@ -1316,24 +1517,53 @@ export function MapDashboardPage() {
         paint: { 'line-color': symbologyColor, 'line-width': 2, 'line-opacity': statusOpacity },
       })
       // A soft halo beneath the main cable line gives routes the glowing,
-      // "highlighted circuit" look of a real fiber network map.
+      // "highlighted circuit" look of a real fiber network map. Left solid
+      // regardless of the cable's own dash pattern — a continuous glow
+      // showing through a dashed line's gaps reads as intentional, not buggy.
       map.addLayer({
         id: 'assets-lines-halo',
         type: 'line',
         source: 'assets',
         filter: ['==', ['geometry-type'], 'LineString'],
         layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: { 'line-color': symbologyColor, 'line-width': 11, 'line-blur': 1.5, 'line-opacity': ['*', 0.22, statusOpacity] },
+        paint: { 'line-color': symbologyColor, 'line-width': haloWidth, 'line-blur': 1.5, 'line-opacity': ['*', 0.22, statusOpacity] },
       })
+      // Split into a fixed set of dash-pattern layers (MapLibre's
+      // line-dasharray isn't data-driven per-feature) filtered by the
+      // dashPatternKey computed above from each symbology's dashArray.
+      const lineLayerIds = ['assets-lines-solid', 'assets-lines-dashed', 'assets-lines-dotted']
+      const dashArrays: Record<string, number[] | undefined> = { 'assets-lines-solid': undefined, 'assets-lines-dashed': [4, 2], 'assets-lines-dotted': [1, 2] }
+      const dashKeys: Record<string, string> = { 'assets-lines-solid': 'solid', 'assets-lines-dashed': 'dashed', 'assets-lines-dotted': 'dotted' }
+      lineLayerIds.forEach((id) => {
+        const dasharray = dashArrays[id]
+        map.addLayer({
+          id,
+          type: 'line',
+          source: 'assets',
+          filter: ['all', ['==', ['geometry-type'], 'LineString'], ['==', ['coalesce', ['get', 'dashPatternKey'], 'solid'], dashKeys[id]]],
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: {
+            'line-color': symbologyColor,
+            'line-width': lineWidth,
+            'line-opacity': statusOpacity,
+            ...(dasharray ? { 'line-dasharray': dasharray } : {}),
+          },
+        })
+      })
+      // Point assets normally render as maplibregl.Marker DOM elements (see
+      // the point-markers effect below), which is invisible to
+      // canvas.toDataURL() — this hidden GL-only stand-in layer is toggled
+      // visible for one frame during Print export (mapExport.ts) so points
+      // actually show up in the exported image.
       map.addLayer({
-        id: 'assets-lines',
-        type: 'line',
+        id: 'assets-points-capture',
+        type: 'circle',
         source: 'assets',
-        filter: ['==', ['geometry-type'], 'LineString'],
-        layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: { 'line-color': symbologyColor, 'line-width': lineWidth, 'line-opacity': statusOpacity },
+        filter: ['==', ['geometry-type'], 'Point'],
+        layout: { visibility: 'none' },
+        paint: { 'circle-radius': 6, 'circle-color': symbologyColor, 'circle-stroke-width': 2, 'circle-stroke-color': '#ffffff', 'circle-opacity': statusOpacity },
       })
-      const layers = ['assets-lines', 'assets-polygons']
+      const layers = [...lineLayerIds, 'assets-polygons']
       if (assetsClickHandlerRef.current) map.off('click', assetsClickHandlerRef.current)
       // A single map-level handler (instead of one per-layer listener each)
       // so a click landing on both a cable and a large background polygon
@@ -1411,6 +1641,7 @@ export function MapDashboardPage() {
               // exact coordinate in as the next vertex instead of opening its
               // review panel — this is how you connect a wire to real assets
               // rather than an approximate nearby spot.
+              linePointsHistory.record()
               setLinePoints((pts) => [...pts, feature.geometry.coordinates as [number, number]])
             } else if (toolRef.current === 'line' || toolRef.current === 'polygon') {
               // Shape already finished (draftGeometry set) — fall through to normal select.
@@ -1436,6 +1667,7 @@ export function MapDashboardPage() {
               // exact coordinate in as the next vertex instead of opening its
               // review panel — this is how you connect a wire to real assets
               // rather than an approximate nearby spot.
+              linePointsHistory.record()
               setLinePoints((pts) => [...pts, feature.geometry.coordinates as [number, number]])
             } else if (toolRef.current === 'line' || toolRef.current === 'polygon') {
               // Shape already finished (draftGeometry set) — fall through to normal select.
@@ -1548,6 +1780,9 @@ export function MapDashboardPage() {
       const el = document.createElement('div')
       paintVertexMarker(el, canDelete)
       const marker = new maplibregl.Marker({ element: el, draggable: true, anchor: 'center' }).setLngLat(coord).addTo(map)
+      // Snapshot once per drag gesture (not per 'drag' tick, which would
+      // otherwise take one undo per pixel moved to fully reverse a drag).
+      marker.on('dragstart', () => editVerticesHistory.record())
       marker.on('drag', () => {
         const { lng, lat } = marker.getLngLat()
         setEditVertices((prev) => {
@@ -1556,10 +1791,28 @@ export function MapDashboardPage() {
           return next
         })
       })
+      // Snapping is applied on drop, not on every drag tick — running the
+      // edge/vertex search on every mousemove would visibly lag on a
+      // project with hundreds of cables (queryRenderedFeatures + turf's
+      // nearestPointOnLine per frame). The final dropped position is what
+      // actually needs to lock on.
+      marker.on('dragend', () => {
+        const { lng, lat } = marker.getLngLat()
+        const snapped = resolveSnappedCoordinate([lng, lat], map.project([lng, lat]))
+        if (snapped[0] !== lng || snapped[1] !== lat) {
+          marker.setLngLat(snapped)
+          setEditVertices((prev) => {
+            const next = [...prev]
+            next[index] = snapped
+            return next
+          })
+        }
+      })
       const deleteBtn = el.querySelector('[data-role="delete-vertex"]') as HTMLButtonElement | null
       if (deleteBtn) {
         deleteBtn.onclick = (e) => {
           e.stopPropagation()
+          editVerticesHistory.record()
           setEditVertices((prev) => prev.filter((_, i) => i !== index))
         }
       }
@@ -1594,6 +1847,7 @@ export function MapDashboardPage() {
       const marker = new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat(mid).addTo(map)
       el.onclick = (e) => {
         e.stopPropagation()
+        editVerticesHistory.record()
         setEditVertices((prev) => {
           const next = [...prev]
           next.splice(insertAt, 0, mid)
@@ -1741,6 +1995,89 @@ export function MapDashboardPage() {
     runWhenStyleReady(applyRf)
   }, [showRfCoverage, selectedFeature, basemapStyle])
 
+  // Visible grid-snap overlay — snapToGrid (lib/snapping.ts) only computes
+  // coordinates, it doesn't draw anything, so without this the grid toggle
+  // had no on-screen effect at all. Recomputed on moveend (not every pan
+  // frame) since it has to regenerate line geometry across the viewport.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    function render() {
+      const m = mapRef.current
+      if (!m) return
+      const source = m.getSource('grid') as maplibregl.GeoJSONSource | undefined
+      const empty: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] }
+
+      if (gridSnapMeters <= 0) {
+        source?.setData(empty)
+        return
+      }
+
+      const center = m.getCenter()
+      const latRad = (center.lat * Math.PI) / 180
+      const stepLng = gridSnapMeters / (111320 * Math.cos(latRad))
+      const stepLat = gridSnapMeters / 110540
+
+      // Skip drawing if the grid would render denser than ~8px apart (an
+      // unreadable solid mesh, and expensive to generate) — zoom in further
+      // to see it, same as any CAD tool's grid fades out when too dense.
+      const p1 = m.project(center)
+      const p2 = m.project([center.lng + stepLng, center.lat])
+      if (Math.hypot(p2.x - p1.x, p2.y - p1.y) < 8) {
+        source?.setData(empty)
+        return
+      }
+
+      const bounds = m.getBounds()
+      const west = Math.floor(bounds.getWest() / stepLng) * stepLng
+      const east = Math.ceil(bounds.getEast() / stepLng) * stepLng
+      const south = Math.floor(bounds.getSouth() / stepLat) * stepLat
+      const north = Math.ceil(bounds.getNorth() / stepLat) * stepLat
+
+      // Cap line count — an oversized viewport at a tiny grid step would
+      // otherwise generate thousands of features for no visible benefit.
+      const maxLines = 400
+      if ((east - west) / stepLng > maxLines || (north - south) / stepLat > maxLines) {
+        source?.setData(empty)
+        return
+      }
+
+      const features: GeoJSON.Feature[] = []
+      for (let lng = west; lng <= east; lng += stepLng) {
+        features.push({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [[lng, south], [lng, north]] } })
+      }
+      for (let lat = south; lat <= north; lat += stepLat) {
+        features.push({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [[west, lat], [east, lat]] } })
+      }
+      const data: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features }
+
+      if (source) {
+        source.setData(data)
+      } else {
+        m.addSource('grid', { type: 'geojson', data })
+        m.addLayer({
+          id: 'grid-lines',
+          type: 'line',
+          source: 'grid',
+          paint: { 'line-color': '#38bdf8', 'line-width': 1, 'line-opacity': 0.35 },
+        })
+      }
+    }
+
+    runWhenStyleReady(render)
+    map.on('moveend', render)
+    return () => {
+      map.off('moveend', render)
+    }
+  }, [gridSnapMeters, basemapStyle])
+
+  // Which undo/redo stack the top-toolbar Undo/Redo buttons (and Ctrl+Z)
+  // act on — an edit-in-progress session takes priority since it's the more
+  // "active" context; otherwise a line/polygon draw-in-progress; otherwise
+  // there's nothing to undo from the toolbar.
+  const historyTarget = editingFeature ? editVerticesHistory : tool === 'line' || tool === 'polygon' ? linePointsHistory : null
+
   const showForm = Boolean(draftGeometry)
   const missingRequiredField = effectiveFields.some((f) => f.required && !templateValues[f.key])
   const needsPhoto = !!activeProject?.photosRequired && photos.length === 0
@@ -1757,6 +2094,42 @@ export function MapDashboardPage() {
     if (!asset) return 'Unknown asset'
     return asset.properties.symbology?.name ?? asset.properties.assetType.replace(/_/g, ' ')
   }
+
+  // Every tool/action reachable from the toolbar, in one flat searchable
+  // list — Ctrl+K or the Search Tools button opens a filterable palette over
+  // this instead of hunting through toolbar icons.
+  const toolCommands: ToolCommand[] = [
+    { id: 'pan', label: 'Pan', keywords: 'select move deselect', icon: <Hand size={14} />, run: exitToNormalMode },
+    ...(canCreateAssets
+      ? [
+          { id: 'point', label: 'Draw Point', keywords: 'add asset marker pin', icon: <MapPin size={14} />, disabled: !pointSymbologies.length || !!editingFeature, run: () => toggleTool('point') },
+          { id: 'line', label: 'Draw Line', keywords: 'add cable draw', icon: <Spline size={14} />, disabled: !lineSymbologies.length || !!editingFeature, run: () => toggleTool('line') },
+          { id: 'polygon', label: 'Draw Polygon', keywords: 'add area shape draw', icon: <Square size={14} />, disabled: !polygonSymbologies.length || !!editingFeature, run: () => toggleTool('polygon') },
+        ]
+      : []),
+    ...(canEditGeometry
+      ? [
+          { id: 'connect', label: 'Connect', keywords: 'network topology link edge', icon: <Link size={14} />, disabled: featureCount < 2 || !!editingFeature, run: () => toggleTool('connect') },
+          { id: 'splice', label: 'Splice', keywords: 'fiber strand port', icon: <Cable size={14} />, disabled: featureCount < 2 || !!editingFeature, run: () => toggleTool('splice') },
+        ]
+      : []),
+    { id: 'distance', label: 'Measure Distance', keywords: 'ruler length', icon: <Ruler size={14} />, disabled: !!editingFeature, run: () => toggleTool('measure-distance') },
+    { id: 'area', label: 'Measure Area', keywords: 'polygon size acreage', icon: <Pentagon size={14} />, disabled: !!editingFeature, run: () => toggleTool('measure-area') },
+    { id: 'undo', label: 'Undo', keywords: 'ctrl z revert', icon: <Undo2 size={14} />, disabled: !historyTarget?.canUndo(), run: () => historyTarget?.undo() },
+    { id: 'redo', label: 'Redo', keywords: 'ctrl shift z', icon: <Redo2 size={14} />, disabled: !historyTarget?.canRedo(), run: () => historyTarget?.redo() },
+    { id: 'snap-toggle', label: snapEnabled ? 'Turn Off Snapping' : 'Turn On Snapping', keywords: 'magnet vertex edge snap', icon: <Magnet size={14} />, run: () => setSnapEnabled((v) => !v) },
+    {
+      id: 'grid-cycle',
+      label: `Grid Snap: ${gridSnapMeters ? `${gridSnapMeters}m` : 'Off'} (click to cycle)`,
+      keywords: 'grid snap spacing',
+      icon: <Grid3x3 size={14} />,
+      run: () => setGridSnapMeters((v) => (v === 0 ? 1 : v === 1 ? 5 : v === 5 ? 10 : 0)),
+    },
+    ...(canCreateAssets ? [{ id: 'import', label: 'Import Survey Data', keywords: 'geojson shapefile kml dxf upload', icon: <Upload size={14} />, disabled: !!editingFeature, run: () => setImportOpen(true) }] : []),
+    { id: 'export', label: 'Export Approved Assets', keywords: 'geojson shapefile download', icon: <Download size={14} />, disabled: !!editingFeature, run: () => setExportOpen(true) },
+    { id: 'print', label: 'Print Map', keywords: 'pdf png export legend scale bar', icon: <Printer size={14} />, disabled: !!editingFeature || !activeProjectId, run: () => setPrintOpen(true) },
+    ...(canApprove ? [{ id: 'simulate-fault', label: 'Simulate Fault', keywords: 'test alarm demo', icon: <Zap size={14} />, disabled: !!editingFeature || simulateFault.isPending || !activeProjectId, run: () => simulateFault.mutate() }] : []),
+  ]
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-white">
@@ -1801,11 +2174,38 @@ export function MapDashboardPage() {
             <ToolbarButton active={tool === 'splice'} disabled={featureCount < 2 || !!editingFeature} onClick={() => toggleTool('splice')} icon={<Cable size={15} />} label={tool === 'splice' ? 'Cancel' : 'Splice'} />
           )}
           <div className="mx-1.5 h-5 w-px bg-white/10" />
+          <ToolbarButton onClick={() => historyTarget?.undo()} disabled={!historyTarget?.canUndo()} icon={<Undo2 size={15} />} label="Undo" />
+          <ToolbarButton onClick={() => historyTarget?.redo()} disabled={!historyTarget?.canRedo()} icon={<Redo2 size={15} />} label="Redo" />
+          <div className="mx-1.5 h-5 w-px bg-white/10" />
+          <ToolbarButton onClick={() => setCommandPaletteOpen(true)} icon={<Search size={15} />} label="Search Tools (Ctrl+K)" />
+          <div className="mx-1.5 h-5 w-px bg-white/10" />
+          <ToolbarButton active={snapEnabled} onClick={() => setSnapEnabled((v) => !v)} icon={<Magnet size={15} />} label={snapEnabled ? 'Snap: On' : 'Snap: Off'} />
+          <select
+            value={gridSnapMeters}
+            onChange={(e) => setGridSnapMeters(Number(e.target.value))}
+            title="Snap new points to a fixed grid spacing"
+            className="h-7 rounded-md border border-white/10 bg-white/[0.06] px-1.5 text-xs font-semibold text-slate-100 outline-none focus:ring-2 focus:ring-primary-400/40"
+          >
+            <option value={0} className="text-ink">
+              Grid: Off
+            </option>
+            <option value={1} className="text-ink">
+              Grid: 1m
+            </option>
+            <option value={5} className="text-ink">
+              Grid: 5m
+            </option>
+            <option value={10} className="text-ink">
+              Grid: 10m
+            </option>
+          </select>
+          <div className="mx-1.5 h-5 w-px bg-white/10" />
           <ToolbarButton active={tool === 'measure-distance'} disabled={!!editingFeature} onClick={() => toggleTool('measure-distance')} icon={<Ruler size={15} />} label={tool === 'measure-distance' ? 'Cancel' : 'Distance'} />
           <ToolbarButton active={tool === 'measure-area'} disabled={!!editingFeature} onClick={() => toggleTool('measure-area')} icon={<Pentagon size={15} />} label={tool === 'measure-area' ? 'Cancel' : 'Area'} />
           <div className="mx-1.5 h-5 w-px bg-white/10" />
           {canCreateAssets && <ToolbarButton disabled={!!editingFeature} onClick={() => setImportOpen(true)} icon={<Upload size={15} />} label="Import" />}
           <ToolbarButton disabled={!!editingFeature} onClick={() => setExportOpen(true)} icon={<Download size={15} />} label="Export" />
+          <ToolbarButton disabled={!!editingFeature || !activeProjectId} onClick={() => setPrintOpen(true)} icon={<Printer size={15} />} label="Print" />
           <div className="mx-1.5 h-5 w-px bg-white/10" />
           <div className="relative flex items-center">
             <Search size={13} className="pointer-events-none absolute left-2.5 text-slate-400" />
@@ -2050,8 +2450,11 @@ export function MapDashboardPage() {
               <span>
                 Click to add {tool === 'polygon' ? 'vertices' : 'points'} ({linePoints.length} placed)
               </span>
-              <button onClick={undoLinePoint} disabled={!linePoints.length} className="ml-1 rounded p-1 hover:bg-white/20 disabled:opacity-40">
+              <button onClick={linePointsHistory.undo} disabled={!linePointsHistory.canUndo()} className="ml-1 rounded p-1 hover:bg-white/20 disabled:opacity-40" title="Undo (Ctrl+Z)">
                 <Undo2 size={14} />
+              </button>
+              <button onClick={linePointsHistory.redo} disabled={!linePointsHistory.canRedo()} className="rounded p-1 hover:bg-white/20 disabled:opacity-40" title="Redo (Ctrl+Shift+Z)">
+                <Redo2 size={14} />
               </button>
               <button onClick={finishShape} disabled={!canFinishShape} className="rounded p-1 hover:bg-white/20 disabled:opacity-40">
                 <Check size={14} />
@@ -2224,6 +2627,99 @@ export function MapDashboardPage() {
                   <Badge tone={selectedFeature.properties.status === 'approved' ? 'success' : selectedFeature.properties.status === 'rejected' ? 'danger' : 'warning'} className="mb-3">
                     {selectedFeature.properties.status}
                   </Badge>
+                  {canCreateAssets && (
+                    <div className="mb-3 rounded-lg border border-slate-200 p-2.5">
+                      <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                        <Waypoints size={12} />
+                        Geometry Tools
+                      </div>
+                      {geometryOpsOpen === 'buffer' || geometryOpsOpen === 'offset' ? (
+                        <div className="flex items-end gap-1.5">
+                          <Input
+                            type="number"
+                            min={0.1}
+                            step={0.5}
+                            label="Distance"
+                            value={geometryOpsDistance}
+                            onChange={(e) => setGeometryOpsDistance(Number(e.target.value) || 0)}
+                            containerClassName="flex-1"
+                          />
+                          <Select
+                            value={geometryOpsUnit}
+                            onChange={(e) => setGeometryOpsUnit(e.target.value as LengthUnit)}
+                            options={[
+                              { value: 'feet', label: 'ft' },
+                              { value: 'meters', label: 'm' },
+                            ]}
+                            containerClassName="w-20"
+                          />
+                          <Button size="sm" onClick={() => applyGeometryOp(geometryOpsOpen)}>
+                            Apply
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={() => setGeometryOpsOpen(null)}>
+                            Cancel
+                          </Button>
+                        </div>
+                      ) : geometryOpsOpen === 'rotate' ? (
+                        <div className="flex items-end gap-1.5">
+                          <Input type="number" step={5} label="Angle (deg, clockwise)" value={geometryOpsAngle} onChange={(e) => setGeometryOpsAngle(Number(e.target.value) || 0)} containerClassName="flex-1" />
+                          <Button size="sm" onClick={() => applyGeometryOp('rotate')}>
+                            Apply
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={() => setGeometryOpsOpen(null)}>
+                            Cancel
+                          </Button>
+                        </div>
+                      ) : geometryOpsOpen === 'scale' ? (
+                        <div className="flex items-end gap-1.5">
+                          <Input type="number" min={0.05} step={0.1} label="Factor (1 = no change)" value={geometryOpsFactor} onChange={(e) => setGeometryOpsFactor(Number(e.target.value) || 1)} containerClassName="flex-1" />
+                          <Button size="sm" onClick={() => applyGeometryOp('scale')}>
+                            Apply
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={() => setGeometryOpsOpen(null)}>
+                            Cancel
+                          </Button>
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap gap-1.5">
+                          <Button size="sm" variant="outline" onClick={() => setGeometryOpsOpen('buffer')}>
+                            Buffer
+                          </Button>
+                          {selectedFeature.geometry.type === 'LineString' && (
+                            <Button size="sm" variant="outline" onClick={() => setGeometryOpsOpen('offset')}>
+                              Offset
+                            </Button>
+                          )}
+                          {selectedFeature.geometry.type === 'Polygon' && (
+                            <>
+                              <Button size="sm" variant="outline" onClick={() => startClip('intersect')} title="Keep only the area shared with a boundary you draw next">
+                                Clip: Keep Overlap
+                              </Button>
+                              <Button size="sm" variant="outline" onClick={() => startClip('difference')} title="Remove the area covered by a boundary you draw next">
+                                Clip: Remove Overlap
+                              </Button>
+                            </>
+                          )}
+                          {selectedFeature.geometry.type !== 'Point' && (
+                            <>
+                              <Button size="sm" variant="outline" onClick={() => setGeometryOpsOpen('rotate')}>
+                                Rotate
+                              </Button>
+                              <Button size="sm" variant="outline" onClick={() => setGeometryOpsOpen('scale')}>
+                                Scale
+                              </Button>
+                              <Button size="sm" variant="outline" onClick={() => applyMirror('horizontal')} title="Flip across a horizontal line through its own center">
+                                Flip Horizontal
+                              </Button>
+                              <Button size="sm" variant="outline" onClick={() => applyMirror('vertical')} title="Flip across a vertical line through its own center">
+                                Flip Vertical
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
                   {assetCustomer && (
                     <div className="mb-3 flex items-center gap-2 rounded-lg bg-primary-50 px-2.5 py-2 text-xs">
                       <Contact size={14} className="shrink-0 text-primary-600" />
@@ -2690,6 +3186,14 @@ export function MapDashboardPage() {
                     Drag a point to move it.
                     {editingFeature.geometry.type !== 'Point' && ' Click a vertex’s × to remove it, or click a midpoint to add one.'}
                   </p>
+                  <div className="mb-2 flex gap-2">
+                    <Button variant="outline" size="sm" leftIcon={<Undo2 size={13} />} onClick={editVerticesHistory.undo} disabled={!editVerticesHistory.canUndo()} className="flex-1" title="Undo (Ctrl+Z)">
+                      Undo
+                    </Button>
+                    <Button variant="outline" size="sm" leftIcon={<Redo2 size={13} />} onClick={editVerticesHistory.redo} disabled={!editVerticesHistory.canRedo()} className="flex-1" title="Redo (Ctrl+Shift+Z)">
+                      Redo
+                    </Button>
+                  </div>
                   <div className="flex gap-2">
                     <Button variant="outline" onClick={cancelEditGeometry} className="flex-1">
                       Cancel
@@ -2724,6 +3228,17 @@ export function MapDashboardPage() {
 
       <ImportModal open={importOpen} onClose={() => setImportOpen(false)} projects={projectsQuery.data?.items ?? []} onDone={invalidateAssets} pushToast={push} />
       <ExportModal open={exportOpen} onClose={() => setExportOpen(false)} projects={projectsQuery.data?.items ?? []} pushToast={push} />
+      <PrintModal
+        open={printOpen}
+        onClose={() => setPrintOpen(false)}
+        mapRef={mapRef}
+        projectName={activeProject?.name ?? 'MapifyIT'}
+        orgName={organization?.name}
+        orgLogoUrl={mediaUrl(organization?.logoUrl)}
+        legend={symbologyLayers.filter((s) => !hiddenSymbologyIds.has(s.id)).map((s) => ({ id: s.id, name: s.name, color: s.color, geometryType: s.geometryType }))}
+        pushToast={push}
+      />
+      <CommandPalette open={commandPaletteOpen} onClose={() => setCommandPaletteOpen(false)} commands={toolCommands} />
       <ConfirmDialog
         open={!!confirmDeleteId}
         title="Remove this asset?"
@@ -3255,6 +3770,22 @@ function PanelHeader({ icon, title, subtitle, right, onClose }: { icon: ReactNod
   )
 }
 
+type ImportFormat = 'geojson' | 'shapefile' | 'kml' | 'dxf'
+
+const IMPORT_FORMAT_OPTIONS: { value: ImportFormat; label: string }[] = [
+  { value: 'geojson', label: 'GeoJSON (.geojson, .json)' },
+  { value: 'shapefile', label: 'Shapefile (.zip)' },
+  { value: 'kml', label: 'KML (.kml)' },
+  { value: 'dxf', label: 'DXF (.dxf)' },
+]
+
+const IMPORT_FORMAT_ACCEPT: Record<ImportFormat, string> = {
+  geojson: '.json,.geojson,application/geo+json,application/json',
+  shapefile: '.zip',
+  kml: '.kml',
+  dxf: '.dxf',
+}
+
 function ImportModal({
   open,
   onClose,
@@ -3269,14 +3800,66 @@ function ImportModal({
   pushToast: (m: string, t?: 'success' | 'error' | 'info') => void
 }) {
   const [projectId, setProjectId] = useState('')
+  const [format, setFormat] = useState<ImportFormat>('geojson')
   const [file, setFile] = useState<File | null>(null)
+  // Shapefile/KML/DXF carry no assetType of their own — every feature in the
+  // file is imported as this one symbology, filtered to its geometry type.
+  const [symbologyId, setSymbologyId] = useState('')
+  // DXF has no CRS at all (arbitrary local drawing units) — this places it
+  // via a planning-grade rotate+scale+offset from a real-world origin
+  // rather than pretending it seamlessly reprojects like the others.
+  const [dxfOriginLng, setDxfOriginLng] = useState('')
+  const [dxfOriginLat, setDxfOriginLat] = useState('')
+  const [dxfRotation, setDxfRotation] = useState('0')
+  const [dxfScale, setDxfScale] = useState('1')
+
+  const symbologiesQuery = useQuery({
+    queryKey: ['projects', projectId, 'symbologies'],
+    queryFn: () => projectsApi.getSymbologies(projectId),
+    enabled: !!projectId && format !== 'geojson',
+  })
+  const symbologies: Symbology[] = symbologiesQuery.data ?? []
+  const selectedSymbology = symbologies.find((s) => s.id === symbologyId)
 
   const importMutation = useMutation({
     mutationFn: async () => {
       if (!file) throw new Error('No file selected')
-      const text = await file.text()
-      const featureCollection = JSON.parse(text)
-      return networkAssetsApi.import({ projectId, featureCollection })
+
+      if (format === 'geojson') {
+        const text = await file.text()
+        const featureCollection = JSON.parse(text)
+        return networkAssetsApi.import({ projectId, featureCollection })
+      }
+
+      if (!selectedSymbology) throw new Error('Choose what asset type to import these features as')
+
+      let result: Awaited<ReturnType<typeof parseShapefile>>
+      if (format === 'shapefile') {
+        result = await parseShapefile(file, selectedSymbology.geometryType)
+      } else if (format === 'kml') {
+        result = await parseKML(file, selectedSymbology.geometryType)
+      } else {
+        const geo: DxfGeoreference = {
+          originLng: Number(dxfOriginLng),
+          originLat: Number(dxfOriginLat),
+          rotationDeg: Number(dxfRotation) || 0,
+          scaleToMeters: Number(dxfScale) || 1,
+        }
+        if (!Number.isFinite(geo.originLng) || geo.originLng < -180 || geo.originLng > 180 || !Number.isFinite(geo.originLat) || geo.originLat < -90 || geo.originLat > 90) {
+          throw new Error('Enter a valid origin longitude (-180 to 180) and latitude (-90 to 90)')
+        }
+        result = await parseDXF(file, selectedSymbology.geometryType, geo)
+      }
+
+      if (!result.features.length) throw new Error(`No ${selectedSymbology.geometryType} features found matching "${selectedSymbology.name}"`)
+      if (result.warning) pushToast(result.warning, 'info')
+      if (result.skipped) pushToast(`Skipped ${result.skipped} feature(s) that didn't match "${selectedSymbology.name}"'s geometry type`, 'info')
+
+      const featureCollection = {
+        type: 'FeatureCollection' as const,
+        features: result.features.map((f) => ({ type: 'Feature' as const, properties: { assetType: selectedSymbology.key }, geometry: f.geometry })),
+      }
+      return networkAssetsApi.import({ projectId, featureCollection: featureCollection as unknown as FeatureCollection })
     },
     onSuccess: (summary) => {
       pushToast(`Imported ${summary.created} of ${summary.total} feature(s)${summary.failed ? ` — ${summary.failed} failed` : ''}`, summary.failed ? 'info' : 'success')
@@ -3284,21 +3867,23 @@ function ImportModal({
       onDone()
       onClose()
     },
-    onError: (err) => pushToast(err instanceof ApiError ? err.message : 'Import failed — check the file is valid GeoJSON', 'error'),
+    onError: (err) => pushToast(err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'Import failed', 'error'),
   })
+
+  const needsSymbology = format !== 'geojson'
 
   return (
     <Modal
       open={open}
       onClose={onClose}
       title="Import Survey Data"
-      subtitle="Upload a GeoJSON file. Each feature needs an assetType property matching the key of a symbology assigned to the project."
+      subtitle={needsSymbology ? 'Upload a file — every feature in it is imported as the asset type chosen below, filtered to its geometry type.' : 'Upload a GeoJSON file. Each feature needs an assetType property matching the key of a symbology assigned to the project.'}
       footer={
         <>
           <Button variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button onClick={() => importMutation.mutate()} loading={importMutation.isPending} disabled={!projectId || !file}>
+          <Button onClick={() => importMutation.mutate()} loading={importMutation.isPending} disabled={!projectId || !file || (needsSymbology && !symbologyId)}>
             Import
           </Button>
         </>
@@ -3306,9 +3891,29 @@ function ImportModal({
     >
       <div className="flex flex-col gap-3">
         <Select label="Project" value={projectId} onChange={(e) => setProjectId(e.target.value)} placeholder="Select project" options={projects.map((p) => ({ value: p.id, label: p.name }))} />
+        <Select label="Format" value={format} onChange={(e) => { setFormat(e.target.value as ImportFormat); setSymbologyId('') }} options={IMPORT_FORMAT_OPTIONS} />
+        {needsSymbology && (
+          <Select
+            label="Import As"
+            value={symbologyId}
+            onChange={(e) => setSymbologyId(e.target.value)}
+            placeholder={symbologiesQuery.isLoading ? 'Loading…' : 'Select asset type'}
+            options={symbologies.map((s) => ({ value: s.id, label: `${s.name} (${s.geometryType})` }))}
+            disabled={!projectId}
+          />
+        )}
+        {format === 'dxf' && (
+          <div className="grid grid-cols-2 gap-2 rounded-lg border border-slate-200 p-2.5">
+            <Input label="Origin Longitude" type="number" step="any" value={dxfOriginLng} onChange={(e) => setDxfOriginLng(e.target.value)} placeholder="-97.7431" />
+            <Input label="Origin Latitude" type="number" step="any" value={dxfOriginLat} onChange={(e) => setDxfOriginLat(e.target.value)} placeholder="30.2672" />
+            <Input label="Rotation (deg)" type="number" step="any" value={dxfRotation} onChange={(e) => setDxfRotation(e.target.value)} />
+            <Input label="Scale to Meters" type="number" step="any" value={dxfScale} onChange={(e) => setDxfScale(e.target.value)} />
+            <p className="col-span-2 text-xs text-slate-500">DXF has no built-in coordinate system — the drawing's (0,0) point is placed at this origin, then rotated and scaled. Treat placement as planning-grade, not survey-grade.</p>
+          </div>
+        )}
         <div>
-          <label className="mb-1.5 block text-sm font-semibold text-slate-700">GeoJSON File</label>
-          <input type="file" accept=".json,.geojson,application/geo+json,application/json" onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="block w-full text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-primary-50 file:px-3 file:py-2 file:text-sm file:font-semibold file:text-primary-700 hover:file:bg-primary-100" />
+          <label className="mb-1.5 block text-sm font-semibold text-slate-700">File</label>
+          <input type="file" accept={IMPORT_FORMAT_ACCEPT[format]} onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="block w-full text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-primary-50 file:px-3 file:py-2 file:text-sm file:font-semibold file:text-primary-700 hover:file:bg-primary-100" />
         </div>
       </div>
     </Modal>
@@ -3383,5 +3988,178 @@ function ExportModal({ open, onClose, projects, pushToast }: { open: boolean; on
         )}
       </div>
     </Modal>
+  )
+}
+
+const PRINT_FORMAT_OPTIONS = [
+  { value: 'png', label: 'PNG Image (.png)' },
+  { value: 'pdf', label: 'PDF Document (.pdf)' },
+]
+
+/**
+ * Exports the live rendered map view (not backend data — see ExportModal for
+ * that) as an image, composited with a title block, scale bar, and legend.
+ * Unlike ExportModal this never hits exportApi.projectGeoJSON; it works
+ * entirely off the map canvas via lib/mapExport.ts.
+ */
+function PrintModal({
+  open,
+  onClose,
+  mapRef,
+  projectName,
+  orgName,
+  orgLogoUrl,
+  legend,
+  pushToast,
+}: {
+  open: boolean
+  onClose: () => void
+  mapRef: React.RefObject<MapLibreMap | null>
+  projectName: string
+  orgName?: string | null
+  orgLogoUrl?: string | null
+  legend: PrintLegendEntry[]
+  pushToast: (m: string, t?: 'success' | 'error' | 'info') => void
+}) {
+  const [format, setFormat] = useState<'png' | 'pdf'>('png')
+
+  const printMutation = useMutation({
+    mutationFn: async () => {
+      const map = mapRef.current
+      if (!map) throw new Error('Map is not ready')
+      const mapImage = await captureMapImage(map)
+      const canvas = await composeExportCanvas(mapImage, map, {
+        title: projectName,
+        subtitle: 'Network Map',
+        legend,
+        orgName,
+        orgLogoUrl,
+      })
+      const filename = `${projectName}-map`
+      if (format === 'pdf') exportCanvasToPDF(canvas, filename)
+      else exportCanvasToPNG(canvas, filename)
+    },
+    onSuccess: () => {
+      pushToast('Map exported', 'success')
+      onClose()
+    },
+    onError: (err) => pushToast(err instanceof Error ? err.message : 'Print export failed', 'error'),
+  })
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Print Map"
+      subtitle="Exports exactly what's visible on the map right now — hidden layers stay hidden."
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={() => printMutation.mutate()} loading={printMutation.isPending}>
+            Export
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <Select label="Format" value={format} onChange={(e) => setFormat(e.target.value as 'png' | 'pdf')} options={PRINT_FORMAT_OPTIONS} />
+        <p className="text-xs text-slate-500">Includes a title block, scale bar, and a legend for every visible asset type.</p>
+      </div>
+    </Modal>
+  )
+}
+
+/** Ctrl+K (or the Search Tools toolbar button) opens this over whatever
+ * `toolCommands` the map assembled for the current permissions/state —
+ * type to filter by label or keyword, arrow keys + Enter to run. */
+function CommandPalette({ open, onClose, commands }: { open: boolean; onClose: () => void; commands: ToolCommand[] }) {
+  const [query, setQuery] = useState('')
+  const [highlighted, setHighlighted] = useState(0)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  // Reset the search on each open — done during render (React's documented
+  // pattern for resetting state on a prop change) rather than in an effect,
+  // so there's no state update to synchronize, just a fresh initial value.
+  const [wasOpen, setWasOpen] = useState(open)
+  if (open !== wasOpen) {
+    setWasOpen(open)
+    if (open) {
+      setQuery('')
+      setHighlighted(0)
+    }
+  }
+
+  // Autofocus is a real side effect on the DOM (not a state sync), so this
+  // one legitimately belongs in an effect.
+  useEffect(() => {
+    if (!open) return
+    const raf = requestAnimationFrame(() => inputRef.current?.focus())
+    return () => cancelAnimationFrame(raf)
+  }, [open])
+
+  if (!open) return null
+
+  const q = query.trim().toLowerCase()
+  const filtered = commands.filter((c) => !q || c.label.toLowerCase().includes(q) || (c.keywords ?? '').toLowerCase().includes(q))
+
+  function run(cmd: ToolCommand) {
+    if (cmd.disabled) return
+    cmd.run()
+    onClose()
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-24" onClick={onClose}>
+      <div className="w-full max-w-md overflow-hidden rounded-xl bg-white shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-2 border-b border-slate-100 px-3 py-2.5">
+          <Search size={15} className="shrink-0 text-slate-400" />
+          <input
+            ref={inputRef}
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value)
+              setHighlighted(0)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'ArrowDown') {
+                e.preventDefault()
+                setHighlighted((i) => Math.min(i + 1, filtered.length - 1))
+              } else if (e.key === 'ArrowUp') {
+                e.preventDefault()
+                setHighlighted((i) => Math.max(i - 1, 0))
+              } else if (e.key === 'Enter') {
+                e.preventDefault()
+                if (filtered[highlighted]) run(filtered[highlighted])
+              }
+            }}
+            placeholder="Search tools…"
+            className="w-full text-sm text-ink outline-none placeholder:text-slate-400"
+          />
+        </div>
+        <div className="max-h-80 overflow-y-auto p-1.5">
+          {filtered.length === 0 ? (
+            <p className="px-3 py-6 text-center text-xs text-slate-400">No tools match "{query}"</p>
+          ) : (
+            filtered.map((cmd, i) => (
+              <button
+                key={cmd.id}
+                type="button"
+                disabled={cmd.disabled}
+                onClick={() => run(cmd)}
+                onMouseEnter={() => setHighlighted(i)}
+                className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                  i === highlighted ? 'bg-primary-50 text-primary-700' : 'text-ink hover:bg-slate-50'
+                }`}
+              >
+                <span className="text-slate-400">{cmd.icon}</span>
+                {cmd.label}
+              </button>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
   )
 }

@@ -9,6 +9,8 @@ export interface SymbologyPayload {
   isEquipment?: boolean
   isCable?: boolean
   isRfSite?: boolean
+  lineWidth?: number
+  dashArray?: number[]
   fields?: AssetTypeField[]
 }
 
@@ -17,7 +19,7 @@ const BASE = '/v1/org/symbologies'
 export const symbologiesApi = {
   list: () => api.get<Symbology[]>(BASE),
   create: (payload: SymbologyPayload) => api.post<Symbology>(BASE, payload),
-  update: (id: string, payload: Partial<Pick<SymbologyPayload, 'name' | 'color' | 'icon' | 'isEquipment' | 'isCable' | 'isRfSite' | 'fields'>>) => api.patch<Symbology>(`${BASE}/${id}`, payload),
+  update: (id: string, payload: Partial<Pick<SymbologyPayload, 'name' | 'color' | 'icon' | 'isEquipment' | 'isCable' | 'isRfSite' | 'lineWidth' | 'dashArray' | 'fields'>>) => api.patch<Symbology>(`${BASE}/${id}`, payload),
   remove: (id: string) => api.del<null>(`${BASE}/${id}`),
   async uploadIcon(id: string, file: File) {
     const form = new FormData()

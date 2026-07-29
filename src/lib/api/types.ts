@@ -98,6 +98,10 @@ export interface Symbology {
   isCable: boolean
   /** Does this symbology represent a radio transmitter whose coverage can be estimated? Org-defined, Point-only. */
   isRfSite: boolean
+  /** Line rendering width in pixels. Only meaningful for LineString (and Polygon outline) symbologies. */
+  lineWidth: number
+  /** MapLibre line-dasharray, e.g. [4, 2] for dashed, [1, 2] for dotted, [] for solid. LineString-only. */
+  dashArray: number[]
   /** Custom attribute schema for assets of this type. Takes precedence over the project's own templateFields when non-empty. */
   fields: AssetTypeField[]
   createdAt: string
@@ -127,11 +131,15 @@ export interface NetworkAssetProperties {
     isEquipment: boolean
     isCable: boolean
     isRfSite: boolean
+    lineWidth: number
+    dashArray: number[]
     fields: AssetTypeField[]
   } | null
   color: string | null
   icon: string | null
   iconUrl: string | null
+  lineWidth: number
+  dashArray: number[]
   assetType: string
   geometryType: GeometryType
   attributes: Record<string, unknown>
